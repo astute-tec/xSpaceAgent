@@ -1,0 +1,23 @@
+#pragma once
+#include <stdint.h>
+#include "esp_err.h"
+
+void recorder_init(const char *hub_ip, int hub_port);
+void recorder_set_url(const char *url, const char *token);
+void recorder_start(void);
+void recorder_stop(void);
+void recorder_request_start(void);  /* 上面键短按：仅开始录音 */
+void recorder_ask(void);
+void recorder_ask_wake(void);
+void recorder_ptt_begin(void);          /* 手指按下：开始缓冲问题 */
+void recorder_ptt_end(bool send);        /* 松手：true=发送 false=取消 */
+int recorder_grab_pcm(int16_t *buf, int max_bytes, int seconds);
+bool recorder_is_busy(void);   /* 录音/问答/收尾中 */
+bool recorder_upload_enroll(const uint8_t *wav, int len, int slot, char *out, int outlen);
+bool recorder_upload_unenroll(int slot);
+bool recorder_upload_rename(int slot, const char *name);          /* 按键触发：开始/结束 */
+const char *recorder_state(void);
+bool recorder_auto_enabled(void);
+void recorder_auto_set(bool on);
+const char *recorder_upload_url(void);
+const char *recorder_upload_token(void);

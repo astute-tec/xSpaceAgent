@@ -1,0 +1,5 @@
+# 服务端依赖（Python 3.10+）
+# HTTP 中继只用标准库；以下为业务侧依赖
+requests>=2.31
+numpy>=1.26          # 声纹 MFCC / 统计量
+# 可选：本地兜底 ASR 用 whisper.cpp 二进制（见 docs）

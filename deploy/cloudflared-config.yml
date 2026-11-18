@@ -1,0 +1,14 @@
+# Cloudflare Tunnel 配置 —— 放在 6.6 的 /etc/cloudflared/config.yml
+# 隧道名：xiaozhi     域名：xiaozhi.halmir.top
+tunnel: xiaozhi
+credentials-file: /etc/cloudflared/<TUNNEL-UUID>.json
+
+ingress:
+  - hostname: xiaozhi.halmir.top
+    service: http://127.0.0.1:8787
+    originRequest:
+      connectTimeout: 10s
+      noTLSVerify: true
+      # 设备上传的音频最大 32MB，留些余量
+      httpHostHeader: xiaozhi.halmir.top
+  - service: http_status:404

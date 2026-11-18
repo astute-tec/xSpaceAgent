@@ -1,0 +1,40 @@
+# ---- 敏感/本地配置（绝不入库）----
+.env
+.env.*
+*.env
+**/device_token
+**/.config/
+secrets/
+*.pem
+*.key
+!firmware/wifi-provision/main/*.h
+
+# ---- 工作区专属（含内部环境信息，不入公共库）----
+AGENTS.md
+
+# ---- 生成物 / 依赖 ----
+.venv/
+venv/
+__pycache__/
+*.pyc
+.DS_Store
+firmware/wifi-provision/build/
+firmware/wifi-provision/managed_components/
+firmware/wifi-provision/sdkconfig
+firmware/wifi-provision/sdkconfig.old
+firmware/wifi-provision/dependencies.lock
+out/
+*.log
+
+# ---- 第三方上游克隆 / 厂商资料（不属于本项目代码）----
+xiaozhi-esp32/
+EspBlufiForAndroid/
+backup/
+deploy/pkg/
+
+# ---- 录音与声纹数据（隐私，不入库）----
+voiceprints/audio/
+voiceprints/library.json
+voiceprints/*.wav
+*.wav
+*.aiff
