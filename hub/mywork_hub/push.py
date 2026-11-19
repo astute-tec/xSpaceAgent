@@ -14,15 +14,27 @@ from . import store
 HOST = os.environ.get("MYWORK_SSH_HOST", "")   # 形如 user@your-server
 REMOTE_MYHOME = os.environ.get("MYWORK_REMOTE_ROOT", "/home/xspace/myWork")
 AGENT = os.environ.get("OPENCLAW_AGENT", "tangseng")
-# 每个 agent 有自己的 workspace 子目录（唐僧 = ~/.openclaw/workspace/tangseng）
-WORKSPACE = Path(os.environ.get("OPENCLAW_WORKSPACE", ""))  # 空则由 push 时按 agent 推导
+# Workspace comes from an explicit override or the installed OpenClaw config.
+_workspace = os.environ.get("OPENCLAW_WORKSPACE", "").strip()
+WORKSPACE = Path(_workspace).expanduser() if _workspace else None
 
 
 def agent_workspace(agent: str) -> Path:
-    """agent 的真实 workspace：~/.openclaw/workspace/<agent>/"""
-    if WORKSPACE and Path(WORKSPACE).exists():
+    """Resolve the configured workspace; do not invent an agent subdirectory."""
+    if WORKSPACE is not None:
         return Path(WORKSPACE)
-    return Path.home() / ".openclaw" / "workspace" / agent
+    state_dir = Path(os.environ.get("OPENCLAW_STATE_DIR", Path.home() / ".openclaw")).expanduser()
+    config = Path(os.environ.get("OPENCLAW_CONFIG_PATH", state_dir / "openclaw.json")).expanduser()
+    try:
+        agents = json.loads(config.read_text(encoding="utf-8")).get("agents", {})
+        for entry in agents.get("list", []):
+            if entry.get("id") == agent and entry.get("workspace"):
+                return Path(entry["workspace"]).expanduser()
+        if agents.get("defaults", {}).get("workspace"):
+            return Path(agents["defaults"]["workspace"]).expanduser()
+    except (OSError, ValueError, AttributeError, TypeError):
+        pass
+    return state_dir / "workspace"
 
 
 def build_message(daily: dict) -> str:
@@ -107,7 +119,9 @@ def push(date: str, daily: dict, *, dry_run: bool = False) -> dict:
 
     mem = write_workspace_memory(date, daily, message)
 
-    binary = _openclaw_bin() if HOST else None
+    # The relay runs on TangSeng itself. A local CLI does not require an SSH
+    # host setting, and avoids an unnecessary SSH hop back to this machine.
+    binary = _openclaw_bin()
     if binary:
         try:
             env = dict(os.environ)
@@ -131,7 +145,10 @@ def push(date: str, daily: dict, *, dry_run: bool = False) -> dict:
             return {"sent": False, "via": "openclaw-cli", "error": str(exc),
                     "memory": mem, "message": message}
 
-    # 没有 CLI：退了 ssh（跨机场景）
+    # 没有 CLI：退回 ssh（跨机场景）
+    if not HOST:
+        return {"sent": False, "via": "unavailable", "memory": mem,
+                "error": "OpenClaw CLI unavailable and MYWORK_SSH_HOST not configured"}
     try:
         proc = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=8", HOST,

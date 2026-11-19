@@ -9,6 +9,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <time.h>
+#include <sys/time.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -44,6 +46,7 @@
 #include "mic.h"
 #include "afe.h"
 #include "recorder.h"
+#include "watchface.h"
 
 extern const uint8_t index_html_start[] asm("_binary_index_html_start");
 extern const uint8_t index_html_end[]   asm("_binary_index_html_end");
@@ -91,6 +94,8 @@ static inline void fill_rect(int x, int y, int w, int h, uint16_t c)
 {
     uint16_t *fb = display_fb();
     if (!fb) return;
+    /* 面板按大端读取 RGB565，ESP32 内存是小端 → 交换字节，否则红变蓝/青变黄 */
+    c = (uint16_t)__builtin_bswap16(c);
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
     if (x + w > LCD_H_RES) w = LCD_H_RES - x;
@@ -653,9 +658,34 @@ void prov_menu_show_qr(void)
 /* ---------------- SNTP 校时（HTTPS 证书需要正确时间） ---------------- */
 #include "esp_sntp.h"
 
+static volatile bool s_clock_synced;
+bool prov_clock_is_synced(void) { return s_clock_synced; }
+
 static void sntp_sync_cb(struct timeval *tv)
 {
+    s_clock_synced = true;
     ESP_LOGI(TAG, "SNTP synced: %lld", (long long)tv->tv_sec);
+    nvs_handle_t h;
+    if (nvs_open("clock", NVS_READWRITE, &h) == ESP_OK) {
+        nvs_set_u64(h, "epoch", (uint64_t)tv->tv_sec);
+        nvs_commit(h);
+        nvs_close(h);
+    }
+}
+
+static void restore_clock(void)
+{
+    nvs_handle_t h;
+    uint64_t epoch = 0;
+    if (nvs_open("clock", NVS_READONLY, &h) == ESP_OK) {
+        nvs_get_u64(h, "epoch", &epoch);
+        nvs_close(h);
+    }
+    if (epoch > 1700000000ULL) {
+        struct timeval tv = {.tv_sec = (time_t)epoch, .tv_usec = 0};
+        settimeofday(&tv, NULL);
+        ESP_LOGI(TAG, "restored clock from NVS: %llu", (unsigned long long)epoch);
+    }
 }
 
 void prov_sntp_start(void)
@@ -875,6 +905,7 @@ static void serial_cli_task(void *arg)
             const char *ssid = s_cur_ssid[0] ? s_cur_ssid : s_wifi_target;
             ESP_LOGI(TAG, "CLI_STATUS state=%d ip=%s ssid=%s rec=%s busy=%d",
                      s_state, s_ip, ssid, recorder_state(), (int)recorder_is_busy());
+            recorder_log_diagnostics();
         } else if (strncmp(line, "TEST ", 5) == 0) {
             /* TEST <ip> <port> —— 测试能否连到 hub */
             char ip[64] = {0};
@@ -953,10 +984,13 @@ static void serial_cli_task(void *arg)
         } else if (strncmp(line, "QUEUELS", 7) == 0) {
             extern void queue_list(void);
             queue_list();
-        } else if (strncmp(line, "CLEAR", 5) == 0) {
+        } else if (!strcmp(line, "STORAGE")) {
+            extern void queue_log_storage(void);
+            queue_log_storage();
+        } else if (!strcmp(line, "CLEAR") || !strcmp(line, "CLEAN")) {
             extern void queue_clear(void);
             queue_clear();
-            ESP_LOGI(TAG, "CLI_CLEAR done");
+            ESP_LOGI(TAG, "CLI_CLEAN scheduled; pending recordings preserved");
         } else if (strncmp(line, "HEAP", 4) == 0) {
             ESP_LOGI(TAG, "HEAP internal=%u psram=%u",
                      (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
@@ -1020,11 +1054,14 @@ static void serial_cli_task(void *arg)
             if (sscanf(line + 5, "%d %15s", &slot, nm) == 2 && slot >= 0 && slot <= 4) {
                 extern void menu_set_slot(int slot, const char *name);
                 extern void menu_save_slot(int slot);
-                menu_set_slot(slot, nm);
-                menu_save_slot(slot);
                 extern bool recorder_upload_rename(int slot, const char *name);
-                recorder_upload_rename(slot, nm);
-                ESP_LOGI(TAG, "CLI_NAME slot=%d name=%s (synced)", slot, nm);
+                bool synced = recorder_upload_rename(slot, nm);
+                if (synced) {
+                    menu_set_slot(slot, nm);
+                    menu_save_slot(slot);
+                }
+                ESP_LOGI(TAG, "CLI_NAME slot=%d name=%s synced=%d stack_free=%u", slot, nm,
+                         synced, (unsigned)uxTaskGetStackHighWaterMark(NULL));
             } else {
                 ESP_LOGI(TAG, "CLI_NAME usage: NAME <0-4> <名字>");
             }
@@ -1045,6 +1082,10 @@ static void serial_cli_task(void *arg)
             extern void recorder_stop(void);
             recorder_stop();
             ESP_LOGI(TAG, "CLI_STOP");
+        } else if (strncmp(line, "KEYTOP", 6) == 0) {
+            extern void recorder_top_key(void);
+            recorder_top_key();
+            ESP_LOGI(TAG, "CLI_KEYTOP");
         } else if (strncmp(line, "START", 5) == 0) {
             extern void recorder_request_start(void);
             recorder_request_start();
@@ -1250,11 +1291,14 @@ static void start_pending_connect(void)
 
 void app_main(void)
 {
+    setenv("TZ", "CST-8", 1);
+    tzset();
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         nvs_flash_erase();
         nvs_flash_init();
     }
+    restore_clock();
 
     s_evt = xEventGroupCreate();
     s_lock = xSemaphoreCreateMutex();
@@ -1350,7 +1394,8 @@ void app_main(void)
         .tx_buffer_size = 1024,
     };
     if (usb_serial_jtag_driver_install(&ujcfg) == ESP_OK) {
-        xTaskCreate(serial_cli_task, "cli", 4096, NULL, 6, NULL);
+        /* NAME/UNENROLL perform a TLS request; 4KB overflowed on real hardware. */
+        xTaskCreate(serial_cli_task, "cli", 8192, NULL, 6, NULL);
         ESP_LOGI(TAG, "serial CLI ready: WIFI <ssid> <pass> | SCAN | STATUS");
     } else {
         ESP_LOGW(TAG, "serial CLI install failed");
@@ -1412,20 +1457,7 @@ void app_main(void)
 /* 待机界面：麦克风图标（外圈 + 底座） */
 void display_idle_ui(void)
 {
-    display_fill(0x0000);                       /* 黑底省电 */
-    int cx = LCD_H_RES / 2;
-    /* 话筒主体（白线） */
-    ui_fill_rect(cx - 55, 90, 110, 160, 0xFFFF);
-    ui_fill_rect(cx - 45, 100, 90, 140, 0x0000);
-    /* 支架 */
-    ui_fill_rect(cx - 8, 250, 16, 60, 0xFFFF);
-    ui_fill_rect(cx - 90, 305, 180, 14, 0xFFFF);
-    /* 底部状态点（暗灰，表示待机） */
-    ui_fill_rect(cx - 10, 380, 20, 20, 0x4208);
-    /* 待机文字提示 */
-    int tw = 6 * UI_FONT_CELL;
-    ui_text((LCD_H_RES - tw) / 2, 418, "按上面键录音", 0xFFFF, 1);
-    display_flush();
+    watchface_draw(WATCHFACE_IDLE, NULL, 0, 0);
 }
 
 /* 给 BLE 模块的状态 JSON（不回传任何密钥） */

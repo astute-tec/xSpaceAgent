@@ -321,6 +321,29 @@ def enroll(path: str | Path, slot: int, lib_path: str | Path, name: str | None =
     }
 
 
+def rename(slot: int, name: str, lib_path: str | Path) -> dict:
+    """Change the display name atomically without rebuilding trained templates."""
+    display_name = name.strip()[:32]
+    if not 0 <= slot <= 4 or not display_name:
+        return {"ok": False, "msg": "无效的名额或姓名"}
+    p = Path(lib_path)
+    with _library_guard(p):
+        lib = _read_library_unlocked(p)
+        keys = [key for key, info in lib.items() if info.get("slot") == slot]
+        if not keys:
+            return {"ok": False, "msg": "该名额尚未录入"}
+        entry = dict(lib[keys[0]])
+        entry["name"] = display_name
+        for key in keys:
+            lib.pop(key)
+        key = display_name
+        if key in lib and lib[key].get("slot") != slot:
+            key = f"{display_name}_{slot + 1}"
+        lib[key] = entry
+        _write_library_unlocked(p, lib)
+    return {"ok": True, "slot": slot, "name": display_name}
+
+
 def unenroll(slot: int, lib_path: str | Path) -> dict:
     if not 0 <= slot <= 4:
         return {"ok": False, "msg": "slot 必须是 0-4"}

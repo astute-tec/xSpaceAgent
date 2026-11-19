@@ -96,6 +96,17 @@ class VoiceprintTests(unittest.TestCase):
         data = json.loads(self.lib.read_text(encoding="utf-8"))
         self.assertEqual({info["slot"] for info in data.values()}, {0, 1})
 
+    def test_rename_preserves_all_voice_templates_and_metadata(self):
+        self.assertTrue(vp.enroll(self.a, 0, self.lib)["ok"])
+        before = vp.load_library(self.lib)["成员1"]
+        result = vp.rename(0, "王阿忠", self.lib)
+        self.assertTrue(result["ok"])
+        after = vp.load_library(self.lib)
+        self.assertNotIn("成员1", after)
+        self.assertEqual(after["王阿忠"], {**before, "name": "王阿忠"})
+        self.assertFalse(vp.rename(1, "张文剑", self.lib)["ok"])
+        self.assertEqual(vp.load_library(self.lib), after)
+
     def test_segments_are_identified_independently(self):
         self.assertTrue(vp.enroll(self.a, 0, self.lib, name="甲")["ok"])
         self.assertTrue(vp.enroll(self.b, 1, self.lib, name="乙")["ok"])

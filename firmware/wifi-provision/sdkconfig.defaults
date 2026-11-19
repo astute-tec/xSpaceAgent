@@ -6,6 +6,8 @@ CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_OCT=y
 CONFIG_SPIRAM_SPEED_80M=y
 CONFIG_SPIRAM_USE_MALLOC=y
+# Opus worker uses a dedicated external-RAM stack; it never accesses Flash/NVS.
+CONFIG_FREERTOS_TASK_CREATE_ALLOW_EXT_MEM=y
 
 # ---- CPU (语音 AFE + WiFi/TLS 并发时保持实时性) ----
 CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y

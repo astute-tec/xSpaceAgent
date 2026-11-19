@@ -13,3 +13,6 @@ void menu_set_slot(int slot, const char *name);
 const char *menu_get_slot(int slot);
 bool menu_load_slots(void);
 void menu_save_slot(int slot);
+bool menu_confirm_enroll(int slot, const char *name);
+void menu_reject_enroll(int slot);
+bool menu_voice_capture_active(void);

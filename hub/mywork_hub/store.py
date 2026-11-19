@@ -19,6 +19,13 @@ def atomic_write(path: Path, text: str) -> None:
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        # A completed rename also needs the directory entry committed before
+        # the recording worker can acknowledge its durable completion.
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

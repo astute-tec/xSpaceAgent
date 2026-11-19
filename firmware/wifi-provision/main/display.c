@@ -31,6 +31,10 @@ static SemaphoreHandle_t s_flush_lock;
 static uint16_t *s_dma_buf = NULL;
 static SemaphoreHandle_t s_frame_lock;
 static SemaphoreHandle_t s_trans_sem;   /* SPI 传输完成信号 */
+static bool s_dma_pending;
+static uint32_t s_full_generation;
+static uint32_t s_drawn_frames;
+static uint32_t s_failed_frames;
 
 static const co5300_lcd_init_cmd_t vendor_init[] = {
     {0xFE, (uint8_t[]){0x20}, 1, 0},
@@ -70,6 +74,24 @@ static void axp2101_init(void)
     axp_write(0x61, 0x02);
     axp_write(0x62, 0x08);
     axp_write(0x63, 0x01);
+}
+
+void display_read_power(display_power_t *out)
+{
+    if (!out) return;
+    memset(out,0,sizeof(*out)); out->percent=-1;
+    if (!s_axp) return;
+    uint8_t reg=0, status[2]={0};
+    if (i2c_master_transmit_receive(s_axp,&reg,1,status,2,20)!=ESP_OK) return;
+    out->battery_present=(status[0] & (1<<3))!=0;
+    out->external_power=(status[0] & (1<<5))!=0;
+    out->charging=((status[1]>>5)&3)==1;
+    if (out->battery_present) {
+        reg=0xa4; uint8_t percent=0xff;
+        if (i2c_master_transmit_receive(s_axp,&reg,1,&percent,1,20)!=ESP_OK || percent>100) return;
+        out->percent=percent;
+    }
+    out->valid=true;
 }
 
 /* SPI 颜色传输完成回调：唤醒 flush 循环等待者 */
@@ -119,6 +141,10 @@ esp_err_t display_init(void)
         .data1_io_num = PIN_LCD_D1,
         .data2_io_num = PIN_LCD_D2,
         .data3_io_num = PIN_LCD_D3,
+        .data4_io_num = GPIO_NUM_NC,
+        .data5_io_num = GPIO_NUM_NC,
+        .data6_io_num = GPIO_NUM_NC,
+        .data7_io_num = GPIO_NUM_NC,
         .max_transfer_sz = LCD_H_RES * LCD_V_RES * sizeof(uint16_t),
         .flags = SPICOMMON_BUSFLAG_QUAD,
     };
@@ -162,7 +188,8 @@ esp_err_t display_init(void)
     /* 预分配 DMA 安全的行缓冲（32 行 × 932 字节 = 30KB 内部 RAM） */
     s_dma_buf = heap_caps_malloc(LCD_H_RES * 8 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!s_dma_buf) {
-        ESP_LOGW(TAG, "DMA buf alloc failed, using 8-line bands");
+        ESP_LOGE(TAG, "DMA buf alloc failed");
+        return ESP_ERR_NO_MEM;
     }
     /* 行缓冲放内部 RAM（DMA 可达），避免 PSRAM 帧缓冲 + 大块 priv TX 分配失败 */
     s_fb = heap_caps_malloc(LCD_H_RES * LCD_V_RES * sizeof(uint16_t), MALLOC_CAP_SPIRAM);
@@ -197,32 +224,53 @@ void display_fill(uint16_t color)
     for (int i = 0; i < LCD_H_RES * LCD_V_RES; i++) s_fb[i] = color;
 }
 
+bool display_flush_rows(int y0, int y1)
+{
+    if (!s_panel || !s_fb || !s_dma_buf || y0 < 0 || y1 > LCD_V_RES || y0 >= y1)
+        return false;
+    if (xSemaphoreTake(s_flush_lock, 0) != pdTRUE) return false;
+    bool ok = true;
+    if (s_dma_pending) {
+        if (xSemaphoreTake(s_trans_sem, 0) != pdTRUE) {
+            xSemaphoreGive(s_flush_lock);
+            return false;
+        }
+        s_dma_pending = false;
+    }
+    for (int y = y0; y < y1; y += 8) {
+        int end = y + 8 < y1 ? y + 8 : y1;
+        memcpy(s_dma_buf, s_fb + (size_t)y * LCD_H_RES,
+               (end - y) * LCD_H_RES * sizeof(uint16_t));
+        esp_err_t rc = esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, end, s_dma_buf);
+        if (rc != ESP_OK) {
+            ESP_LOGW(TAG, "display submit failed y=%d rc=%s", y, esp_err_to_name(rc));
+            ok = false;
+            break;
+        }
+        s_dma_pending = true;
+        if (xSemaphoreTake(s_trans_sem, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "display DMA timeout y=%d", y);
+            ok = false;
+            break;
+        }
+        s_dma_pending = false;
+    }
+    if (ok) s_drawn_frames++;
+    else s_failed_frames++;
+    xSemaphoreGive(s_flush_lock);
+    return ok;
+}
+
+uint32_t display_full_generation(void) { return __atomic_load_n(&s_full_generation, __ATOMIC_RELAXED); }
+
+void display_log_diagnostics(void)
+{
+    ESP_LOGI(TAG, "health frames=%lu failed=%lu dma_pending=%d",
+             (unsigned long)s_drawn_frames, (unsigned long)s_failed_frames, s_dma_pending);
+}
+
 void display_flush(void)
 {
-    if (!s_panel || !s_fb) return;
-    /* 互斥：多个任务同时刷屏会让 SPI 总线冲突 */
-    if (xSemaphoreTake(s_flush_lock, 0) != pdTRUE) return;   /* 忙则跳过本帧 */
-    if (s_dma_buf) {
-        /* 用预分配的内部 RAM DMA 缓冲，32 行一批 */
-        const int BAND = 8;
-        for (int y = 0; y < LCD_V_RES; y += BAND) {
-            int y2 = y + BAND;
-            if (y2 > LCD_V_RES) y2 = LCD_V_RES;
-            int rows = y2 - y;
-            memcpy(s_dma_buf, s_fb + (size_t)y * LCD_H_RES, rows * LCD_H_RES * sizeof(uint16_t));
-            esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y2, s_dma_buf);
-            /* 等这一批 SPI/DMA 真正传完，再覆盖 s_dma_buf（否则数据被改写→噪点） */
-            xSemaphoreTake(s_trans_sem, pdMS_TO_TICKS(100));
-        }
-    } else {
-        /* 没有 DMA 缓冲则逐 2 行推送 */
-        for (int y = 0; y < LCD_V_RES; y += 2) {
-            int y2 = y + 2;
-            if (y2 > LCD_V_RES) y2 = LCD_V_RES;
-            esp_lcd_panel_draw_bitmap(s_panel, 0, y, LCD_H_RES, y2,
-                                      s_fb + (size_t)y * LCD_H_RES);
-            xSemaphoreTake(s_trans_sem, pdMS_TO_TICKS(100));
-        }
-    }
-    xSemaphoreGive(s_flush_lock);
+    __atomic_add_fetch(&s_full_generation, 1, __ATOMIC_RELAXED);
+    display_flush_rows(0, LCD_V_RES);
 }

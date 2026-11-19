@@ -13,3 +13,4 @@ bool afe_reset_output(uint32_t timeout_ms);
 bool afe_is_ready(void);
 /* 获取最近约 1 秒的原始麦克风 RMS（每项约 10ms，返回实际数量）。 */
 int afe_get_level_history(uint16_t *out, int max_items);
+void afe_log_diagnostics(void);

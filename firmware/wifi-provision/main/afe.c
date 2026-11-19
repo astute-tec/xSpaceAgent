@@ -40,6 +40,7 @@ static volatile uint32_t s_overflows;
 #define LEVEL_HISTORY 96                        /* 96 * 10ms ~= 1 秒 */
 static uint16_t s_level_history[LEVEL_HISTORY];
 static uint32_t s_level_seq;
+static uint32_t s_fetch_seq;
 static portMUX_TYPE s_level_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static void drain_output_ring(void)
@@ -54,6 +55,20 @@ static void drain_output_ring(void)
 }
 
 bool afe_is_ready(void) { return s_ready; }
+
+void afe_log_diagnostics(void)
+{
+    uint16_t levels[96];
+    int n = afe_get_level_history(levels, 96);
+    int low = UINT16_MAX, high = 0;
+    for (int i = 0; i < n; i++) {
+        if (levels[i] < low) low = levels[i];
+        if (levels[i] > high) high = levels[i];
+    }
+    ESP_LOGI(TAG, "health feed=%lu fetch=%lu rms=%d..%d overflow=%lu",
+             (unsigned long)s_level_seq, (unsigned long)s_fetch_seq,
+             n ? low : 0, high, (unsigned long)s_overflows);
+}
 
 int afe_get_level_history(uint16_t *out, int max_items)
 {
@@ -146,12 +161,16 @@ static void fetch_task(void *arg)
             continue;
         }
         afe_fetch_result_t *res = s_afe->fetch(s_afe_data);
-        if (!res || res->ret_value != ESP_OK) continue;
+        if (!res || res->ret_value != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
         /* 1) 唤醒检测（AFE 内置 wakenet） */
+        s_fetch_seq++;
         if (res->wakeup_state == WAKENET_DETECTED) {
             ESP_LOGI(TAG, "WAKE WORD detected (你好小智)");
             extern void recorder_ask_wake(void);
-            recorder_ask_wake();          /* 录音中先停录音，问答后自动续录 */
+            recorder_ask_wake();          /* 仅投递事件，不在 fetch 线程中等待自己复位 */
         }
         /* 2) 增强后的单声道音频入环形队列，供录音/问答取用 */
         if (xRingbufferSend(s_ring, res->data, res->data_size, 0) != pdTRUE) {
@@ -175,6 +194,8 @@ esp_err_t afe_init(void)
      * 一个通道输出，两个 TDM slot 是同一信号——不存在独立参考通道）。
      * 不开 AEC：参考=语音本身会把语音当回声消掉。设备录音时不播放音频，无回声。 */
     srmodel_list_t *models = esp_srmodel_init("model");
+    char *wake_model = models ? esp_srmodel_filter(models, "wn", "nihaoxiaozhi") : NULL;
+    ESP_LOGI(TAG, "wake model=%s", wake_model ? wake_model : "(missing)");
     afe_type_t type = AFE_TYPE_SR;
     afe_mode_t mode = AFE_MODE_LOW_COST;
     afe_config_t *cfg = afe_config_init("M", models, type, mode);
@@ -183,6 +204,8 @@ esp_err_t afe_init(void)
         return ESP_FAIL;
     }
     cfg->aec_init = false;
+    cfg->wakenet_init = wake_model != NULL;
+    cfg->wakenet_model_name = wake_model;
     cfg->ns_init = true;
     cfg->vad_init = false;   /* 远场低 SNR 时 VAD 会门掉整段，先关 */
     cfg->agc_init = true;                   /* 远场小声自动增益（核心远场增益来源） */

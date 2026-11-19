@@ -26,6 +26,7 @@
 #include "afe.h"
 #include "menu.h"
 #include "font_cn.h"
+#include "queue.h"
 
 static const char *TAG = "menu";
 
@@ -45,6 +46,7 @@ static volatile bool s_vp_task_running = false;
 static TaskHandle_t s_vp_task = NULL;
 static portMUX_TYPE s_vp_mux = portMUX_INITIALIZER_UNLOCKED;
 static char s_hint[64] = "";
+static bool s_vp_dirty;
 
 /* ---------- 绘图原语 ---------- */
 
@@ -208,6 +210,8 @@ static void draw_vp(void)
             ui_text(VP_X[i] - tw / 2, VP_Y[i] + 46, label, 0xFFFF, 1);
         } else if (i == s_enrolling_slot) {
             disc(VP_X[i], VP_Y[i], 16, 0xF800);      /* 录入中：红点 */
+        } else if (queue_enroll_pending(i)) {
+            ui_text(VP_X[i] - UI_FONT_CELL, VP_Y[i] - 12, "待传", 0xFFFF, 1);
         } else {
             icon_plus(VP_X[i], VP_Y[i], 40, 0xFFFF);
         }
@@ -222,7 +226,7 @@ static void draw_vp(void)
         ui_text((LCD_H_RES - w) / 2, 408, msg, 0xFFFF, 1);
         ui_text(200, 438, "取消", 0xFFFF, 1);
     } else if (s_enroll_state == 2) {
-        ui_text(150, 408, "上传中", 0xFFFF, 1);
+        ui_text(150, 408, "已保存待上传", 0xFFFF, 1);
     } else if (s_enroll_state == 6) {
         ui_text(150, 408, "删除中", 0xFFFF, 1);
     } else if (s_enroll_state == 3) {
@@ -230,7 +234,7 @@ static void draw_vp(void)
     } else if (s_enroll_state == 5) {
         ui_text(60, 408, "无网络 请先配WiFi", 0xFFFF, 1);
     } else if (s_enroll_state == 4) {
-        ui_text(150, 408, "失败", 0xFFFF, 1);
+        ui_text(80, 408, s_hint[0] ? s_hint : "失败", 0xFFFF, 1);
     } else {
         const char *hint = "点击加号录声纹";
         tw = 7 * UI_FONT_CELL;
@@ -259,6 +263,8 @@ static void vp_redraw(void)
         display_frame_give();
     }
 }
+
+bool menu_voice_capture_active(void) { return s_vp_task_running; }
 
 static bool vp_claim(int slot, int state)
 {
@@ -391,7 +397,8 @@ static void enroll_task(void *arg)
     int last_shown = secs;
     const int chunk = 16000 * 2 / 10;  /* 100ms 一块 = 3200 字节 */
 
-    while (got < pcm_bytes && !s_enroll_abort) {
+    while (got < pcm_bytes && !s_enroll_abort &&
+           esp_timer_get_time() / 1000 - start_ms < 11000) {
         int want = pcm_bytes - got;
         if (want > chunk) want = chunk;
 
@@ -443,30 +450,12 @@ static void enroll_task(void *arg)
     memcpy(wav + 36, "data", 4); memcpy(wav + 40, &dl, 4);
 
     /* ⑥ 先落盘（上传失败也不丢样本，后台任务会自动重试） */
-    extern esp_err_t queue_save_enroll(int slot, const uint8_t *wav, int len);
-    extern void queue_remove_enroll(int slot);
-    extern int queue_flush_enroll(void);
     bool saved = (queue_save_enroll(slot, wav, got + 44) == ESP_OK);
-
-    /* ⑦ 立即尝试上传 */
-    s_enroll_state = 2;
-    vp_redraw();
-
-    char name[32] = {0};
-    bool uploaded = recorder_upload_enroll(wav, got + 44, slot, name, sizeof(name));
     free(wav);
-    if (uploaded) {
-        queue_remove_enroll(slot);
-        snprintf(s_slots[slot], sizeof(s_slots[slot]), "%s", name);
-        menu_save_slot(slot);
-        ESP_LOGI(TAG, "enroll ok slot=%d name=%s", slot, name);
-        vp_finish_task(3, "完成", 2000);
-    } else if (saved) {
-        ESP_LOGW(TAG, "enroll upload failed slot=%d, sample kept for retry", slot);
-        vp_finish_task(2, "已保存待重试", 2500);   /* 状态 2 = 上传中样式文字 */
+    if (saved) {
+        vp_finish_task(2, "", 1000);
     } else {
-        ESP_LOGW(TAG, "enroll failed slot=%d (not saved)", slot);
-        vp_finish_task(4, "上传失败", 2000);
+        vp_finish_task(4, "保存失败", 2000);
     }
     return;
 }
@@ -523,6 +512,14 @@ void menu_open(void)
 /* 由触摸任务周期调用：处理 WiFi 连接结果 */
 void menu_poll(void)
 {
+    if (s_page == PAGE_VP) {
+        taskENTER_CRITICAL(&s_vp_mux);
+        bool dirty = s_vp_dirty;
+        s_vp_dirty = false;
+        taskEXIT_CRITICAL(&s_vp_mux);
+        if (dirty) vp_redraw();
+        return;
+    }
     if (s_page != PAGE_WIFI || s_wifi_qr) return;
     extern int prov_wifi_status(void);
     int st = prov_wifi_status();
@@ -578,7 +575,7 @@ bool menu_long_press(int x, int y)
     for (int i = 0; i < 5; i++) {
         int dx = x - VP_X[i], dy = y - VP_Y[i];
         if (dx * dx + dy * dy <= (VP_R + 12) * (VP_R + 12)) {
-            if (s_slots[i][0] == 0 || s_vp_task_running) return true;
+            if (s_slots[i][0] == 0 || s_vp_task_running || queue_enroll_pending(i)) return true;
             ESP_LOGI(TAG, "delete voiceprint slot %d (%s)", i, s_slots[i]);
             if (!vp_claim(i, 6)) return true;
             vp_redraw();
@@ -669,7 +666,9 @@ bool menu_tap(int x, int y)
         for (int i = 0; i < 5; i++) {
             int dx = x - VP_X[i], dy = y - VP_Y[i];
             if (dx * dx + dy * dy <= (VP_R + 12) * (VP_R + 12)) {
-                if (s_slots[i][0]) {
+                if (queue_enroll_pending(i)) {
+                    return true;
+                } else if (s_slots[i][0]) {
                     ESP_LOGI(TAG, "slot %d already enrolled (%s)", i, s_slots[i]);
                 } else {
                     if (!vp_claim(i, 1)) return true;
@@ -721,4 +720,35 @@ void menu_save_slot(int slot)
     nvs_set_str(h, key, s_slots[slot]);
     nvs_commit(h);
     nvs_close(h);
+}
+
+bool menu_confirm_enroll(int slot, const char *name)
+{
+    if (slot < 0 || slot >= 5 || !name || !name[0]) return false;
+    nvs_handle_t h;
+    if (nvs_open("voice", NVS_READWRITE, &h) != ESP_OK) return false;
+    char key[8];
+    snprintf(key, sizeof(key), "s%d", slot);
+    esp_err_t rc = nvs_set_str(h, key, name);
+    if (rc == ESP_OK) rc = nvs_commit(h);
+    nvs_close(h);
+    if (rc != ESP_OK) return false;
+    taskENTER_CRITICAL(&s_vp_mux);
+    snprintf(s_slots[slot], sizeof(s_slots[slot]), "%s", name);
+    s_vp_dirty = true;
+    taskEXIT_CRITICAL(&s_vp_mux);
+    ESP_LOGI(TAG, "voiceprint confirmed slot=%d", slot);
+    return true;
+}
+
+void menu_reject_enroll(int slot)
+{
+    taskENTER_CRITICAL(&s_vp_mux);
+    if (!s_vp_task_running) {
+        s_enroll_state = 4;
+        snprintf(s_hint, sizeof(s_hint), "%s", "请靠近重新录音");
+    }
+    s_vp_dirty = true;
+    taskEXIT_CRITICAL(&s_vp_mux);
+    ESP_LOGW(TAG, "voiceprint sample rejected slot=%d", slot);
 }

@@ -6,3 +6,4 @@
 
 /* 画一行 UTF-8 文本；scale=1/2；返回绘制宽度 */
 int ui_text(int x, int y, const char *utf8, uint16_t color, int scale);
+int ui_text_clipped(int x, int y, const char *utf8, uint16_t color, int scale, int top, int bottom);

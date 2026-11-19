@@ -21,11 +21,9 @@ SYSTEM = """你是忠哥的工作秘书。下面是某一天从办公室语音�
 3. todos：把各项目的待办汇总去重。
 4. suggestions：明天/接下来的建议，最多 3 条，要具体。
 5. 不要编造片段里没有的信息；片段里含糊的地方，宁可略过。
-6. 片段可能带 [位置:L]/[位置:R] 标记（双麦克风判断说话人方位，左/右两个位置）。
-   办公室里目前两个人：文剑（张文剑）、进坤（袁进坤）。请结合内容与方位，把发言归属到人：
-   - 内容能明确指向（如"我是文剑"、别人喊他名字、职责吻合）→ 直接用姓名
-   - 不能确定 → 标注"位置L/位置R（疑似·某）"，绝不硬猜
-   - 在日报里给一段「说话人说明」解释你的映射依据
+6. [说话人:姓名] 来自逐段声纹结果；不得根据座位、职责或谈话内容猜测身份。
+   [说话人:其他人] 必须保留为其他人，不能强行对应已登记成员。
+   发言人不一定是任务负责人；没有明确指派，不可把发言人自动填为负责人。
 
 只输出 JSON：
 {"one_liner":"","projects":[{"name":"","status":[""],"decisions":[""],"risks":[""],"todos":[{"what":"","owner":"","due":""}]}],"todos":[{"what":"","owner":"","due":"","project":""}],"suggestions":[""]}"""
@@ -61,10 +59,11 @@ def build_daily(date: str, sessions: list[dict], entities: list[str] | None = No
         for seg in s.get("kept", []):
             t = store.ts(seg["start_ms"])
             proj = f"[{seg['project']}]" if seg.get("project") else ""
-            lines.append(f"{t} {tag}{proj} {seg['text']}")
+            speaker = seg.get("speaker", "其他人")
+            lines.append(f"{s.get('captured_at', '')} {t} [说话人:{speaker}] {proj} {seg['text']}")
         for seg in s.get("review", []):
             t = store.ts(seg["start_ms"])
-            lines.append(f"{t} {tag}(存疑) {seg['text']}")
+            lines.append(f"{s.get('captured_at', '')} {t} [说话人:{seg.get('speaker', '其他人')}] (存疑) {seg['text']}")
 
     if not lines:
         return {

@@ -17,11 +17,13 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -32,6 +34,7 @@ from mywork_hub import pipeline, push, report  # noqa: E402
 from mywork_hub import ask as askmod  # noqa: E402
 from mywork_hub.asr_aliyun import transcribe_file  # noqa: E402
 from mywork_hub.config import cfg  # noqa: E402
+from mywork_hub.inbox import DurableInbox, SegmentConflict, processed_audio_names  # noqa: E402
 
 MAX_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "32")) * 1024 * 1024
 DEVICE_TOKEN = os.environ.get("DEVICE_TOKEN", "")
@@ -41,6 +44,19 @@ DEPLOY_DIR = Path(os.environ.get("DEPLOY_DIR", Path(__file__).resolve().parents[
 PROCESS_LOCK = threading.Lock()
 INBOX_LOCK = threading.Lock()
 RATE: dict[str, list[float]] = {}
+ASK_JOBS: dict[str, dict] = {}
+ASK_JOBS_LOCK = threading.Lock()
+ASK_AUDIO_CONDITION = threading.Condition(ASK_JOBS_LOCK)
+RECORDING_WAKE = threading.Event()
+_recording_inboxes: dict[str, DurableInbox] = {}
+
+
+def recording_inbox() -> DurableInbox:
+    key = str(INBOX.resolve())
+    with INBOX_LOCK:
+        if key not in _recording_inboxes:
+            _recording_inboxes[key] = DurableInbox(INBOX)
+        return _recording_inboxes[key]
 
 START = time.time()
 
@@ -63,6 +79,22 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def _read_body(self, length: int) -> bytes:
+        self.connection.settimeout(20)
+        data = bytearray()
+        started = time.monotonic()
+        try:
+            while len(data) < length:
+                part = self.rfile.read1(min(65536, length - len(data)))
+                if not part: break
+                data.extend(part)
+        except TimeoutError:
+            self.close_connection = True
+            log(f"[http] {self.path} body timeout {len(data)}/{length}")
+        if len(data) != length or time.monotonic() - started > 3:
+            log(f"[http] {self.path} body={len(data)}/{length} elapsed={time.monotonic()-started:.1f}s")
+        return bytes(data)
+
     def _json(self, code: int, obj: dict) -> None:
         body = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
@@ -72,6 +104,51 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/v1/voiceprints":
+            token = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            if not DEVICE_TOKEN or not hmac.compare_digest(token, DEVICE_TOKEN):
+                self._json(401, {"ok": False})
+                return
+            from mywork_hub import voiceprint_np as vp
+            lib = vp.load_library(cfg.root.parent / "voiceprints" / "library.json")
+            slots = [{"slot": entry["slot"], "name": entry["name"]}
+                     for entry in lib.values() if "slot" in entry and "name" in entry]
+            self._json(200, {"ok": True, "slots": slots})
+            return
+        if self.path.startswith("/v1/ask/"):
+            token = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+            if not DEVICE_TOKEN or not hmac.compare_digest(token, DEVICE_TOKEN):
+                self._json(401, {"ok": False})
+                return
+            job_id = self.path.removeprefix("/v1/ask/")
+            streaming = job_id.endswith("/audio")
+            if streaming:
+                job_id = job_id.removesuffix("/audio")
+                self._stream_answer(job_id)
+                return
+            with ASK_JOBS_LOCK:
+                job = dict(ASK_JOBS.get(job_id) or {})
+            if not job:
+                self._json(404, {"ok": False, "msg": "job expired"})
+            elif self.headers.get("X-Ask-Status") == "1":
+                # Publish text before TTS/PCM transfer, even if TTS subsequently fails.
+                self._json(202, {"ok": True, "job": job_id, "stage": job["stage"],
+                                 "state": job["state"], "answer": job.get("answer", ""),
+                                 "stream_ready": job.get("stream_ready", False),
+                                 "msg": job.get("error", "")})
+            elif job["state"] == "done":
+                audio = job["audio"]
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/pcm;rate=16000;channels=2;format=s16le")
+                self.send_header("Content-Length", str(len(audio)))
+                self.end_headers()
+                self.wfile.write(audio)
+                log(f"[ask {job_id}] 播报音频已返回 {len(audio)} 字节")
+            elif job["state"] == "failed":
+                self._json(422, {"ok": False, "stage": job["stage"], "msg": job["error"]})
+            else:
+                self._json(202, {"ok": True, "job": job_id, "stage": job["stage"]})
+            return
         if self.path.startswith("/deploy/"):
             name = self.path[len("/deploy/"):]
             target = (DEPLOY_DIR / name).resolve()
@@ -134,7 +211,7 @@ class Handler(BaseHTTPRequestHandler):
         if not (0 <= slot <= 4):
             self._json(400, {"ok": False, "msg": "slot 0-4"})
             return
-        data = self.rfile.read(length)
+        data = self._read_body(length)
         if len(data) != length:
             self._json(400, {"ok": False, "msg": "incomplete body"})
             return
@@ -181,7 +258,29 @@ class Handler(BaseHTTPRequestHandler):
         if length <= 0 or length > MAX_BYTES:
             self._json(400, {"ok": False, "msg": "bad size"})
             return
-        data = self.rfile.read(length)
+        data = self._read_body(length)
+        if len(data) != length:
+            log(f"[ask] 请求体不完整 {len(data)}/{length}")
+            self._json(400, {"ok": False, "msg": "incomplete body"})
+            return
+        if self.headers.get("X-Async-Response") == "1":
+            with ASK_JOBS_LOCK:
+                now = time.monotonic()
+                expired = [key for key, item in ASK_JOBS.items() if now - item["created"] > 600]
+                for key in expired: ASK_JOBS.pop(key, None)
+                if len(ASK_JOBS) >= 4:
+                    completed = [key for key, item in ASK_JOBS.items() if item["state"] != "working"]
+                    if completed: ASK_JOBS.pop(completed[0], None)
+                if len(ASK_JOBS) >= 4:
+                    self._json(503, {"ok": False, "msg": "ask queue busy"})
+                    return
+                job_id = uuid.uuid4().hex
+                ASK_JOBS[job_id] = {"state": "working", "stage": "received", "created": now,
+                                    "streaming": self.headers.get("X-Stream-Audio") == "1"}
+            threading.Thread(target=process_ask, args=(job_id, data), daemon=True).start()
+            log(f"[ask {job_id}] 问题音频已完整接收 {len(data)} 字节")
+            self._json(202, {"ok": True, "job": job_id, "stage": "received"})
+            return
         INBOX.mkdir(parents=True, exist_ok=True)
         path = INBOX / f"ask_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
         path.write_bytes(data)
@@ -245,18 +344,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             from mywork_hub import voiceprint_np as vp
             lib_path = cfg.root.parent / "voiceprints" / "library.json"
-            lib = vp.load_library(lib_path)
-            old = [k for k, v in lib.items() if v.get("slot") == slot]
-            emb = []
-            if old:
-                emb = lib[old[0]].get("embedding", [])
-            for k in old:
-                lib.pop(k, None)
-            if emb:
-                lib[name] = {"slot": slot, "embedding": emb, "samples": 1}
-            vp.save_library(lib_path, lib)
-            log(f"[rename] slot={slot} {old} -> {name}")
-            self._json(200, {"ok": True, "name": name})
+            result = vp.rename(slot, name, lib_path)
+            log(f"[rename] slot={slot} name={name} ok={result['ok']}")
+            self._json(200 if result["ok"] else 404, result)
         except Exception as exc:  # noqa: BLE001
             log(f"[rename] 失败：{exc}")
             self._json(500, {"ok": False, "msg": str(exc)[:200]})
@@ -310,11 +400,11 @@ class Handler(BaseHTTPRequestHandler):
             self._json(413, {"ok": False, "msg": f"too large ({length} > {MAX_BYTES})"})
             return
 
-        data = self.rfile.read(length)
+        data = self._read_body(length)
         if len(data) != length:
             self._json(400, {"ok": False, "msg": "incomplete body"})
             return
-        if len(data) < 1000:
+        if len(data) < 80:
             self._json(400, {"ok": False, "msg": "too small"})
             return
 
@@ -325,34 +415,149 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not segment_id:
             segment_id = f"legacy_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{time.time_ns() & 0xfffffff:x}"
-        path = INBOX / f"dev_{segment_id}.wav"
-        digest = hashlib.sha256(data).digest()
-        duplicate = False
-        with INBOX_LOCK:
-            if path.exists():
-                existing = path.read_bytes()
-                if len(existing) != len(data) or hashlib.sha256(existing).digest() != digest:
-                    self._json(409, {"ok": False, "msg": "segment id conflict"})
-                    return
-                duplicate = True
-            else:
-                part = INBOX / f".{path.name}.{os.getpid()}.{threading.get_ident()}.part"
-                with part.open("wb") as fh:
-                    fh.write(data)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-                os.replace(part, path)
-                dir_fd = os.open(INBOX, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-        log(f"{'重复确认' if duplicate else '收到'} {len(data)} 字节 from {ip} -> {path.name}")
-
-        self._json(202, {"ok": True, "id": segment_id, "bytes": len(data), "duplicate": duplicate})
-        if duplicate:
+        digest = hashlib.sha256(data).hexdigest()
+        expected = self.headers.get("X-Content-SHA256", "").strip().lower()
+        if expected and not hmac.compare_digest(expected, digest):
+            self._json(400, {"ok": False, "msg": "sha256 mismatch"})
             return
-        threading.Thread(target=process, args=(path,), daemon=True).start()
+        suffix = ".opus" if data.startswith(b"OggS") else ".wav"
+        if suffix == ".opus":
+            valid = b"OpusHead" in data[:64]
+        else:
+            valid = data[:4] == b"RIFF" and data[8:12] == b"WAVE"
+        if not valid:
+            self._json(415, {"ok": False, "msg": "expected WAV or Ogg Opus"})
+            return
+        captured = self.headers.get("X-Captured-At", "")
+        if captured and (not captured.isdecimal() or not 1700000000 <= int(captured) <= time.time()+300):
+            self._json(400, {"ok": False, "msg": "bad capture timestamp"})
+            return
+        try:
+            receipt = recording_inbox().receive(segment_id, data, suffix, int(captured) if captured else None)
+        except SegmentConflict:
+            self._json(409, {"ok": False, "msg": "segment id conflict"})
+            return
+        except (OSError, sqlite3.Error) as exc:
+            log(f"保存录音失败：{type(exc).__name__}")
+            self._json(503, {"ok": False, "msg": "durable storage unavailable"})
+            return
+        log(f"录音已持久接收 id={segment_id} bytes={len(data)} duplicate={receipt['duplicate']}")
+        RECORDING_WAKE.set()
+        self._json(202, receipt)
+
+    def _stream_answer(self, job_id: str):
+        """Bounded producer wait; preserve legacy full-audio GET for old firmware."""
+        deadline = time.monotonic()+90
+        with ASK_AUDIO_CONDITION:
+            job = ASK_JOBS.get(job_id)
+            if not job or not job.get("streaming"):
+                self._json(404, {"ok": False, "msg": "stream unavailable"})
+                return
+            while not job.get("chunks") and job["state"] == "working" and time.monotonic()<deadline:
+                ASK_AUDIO_CONDITION.wait(min(1, max(0, deadline-time.monotonic())))
+            if not job.get("chunks"):
+                self._json(422, {"ok": False, "msg": job.get("error", "audio timeout")})
+                return
+        self.send_response(200)
+        self.send_header("Content-Type", "audio/pcm;rate=16000;channels=1;format=s16le")
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        index=0
+        try:
+            while time.monotonic()<deadline:
+                with ASK_AUDIO_CONDITION:
+                    chunks=job.get("chunks", [])
+                    if index<len(chunks):
+                        chunk=chunks[index]; index+=1
+                    elif job["state"] == "done":
+                        self.wfile.write(b"0\r\n\r\n"); self.wfile.flush(); return
+                    elif job["state"] == "failed":
+                        return  # incomplete chunked body lets the device detect failure
+                    else:
+                        ASK_AUDIO_CONDITION.wait(1); continue
+                self.wfile.write(f"{len(chunk):x}\r\n".encode()+chunk+b"\r\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            log(f"[ask {job_id}] 播放连接断开，已保留文字结果")
+
+
+def process_ask(job_id: str, data: bytes) -> None:
+    started = time.monotonic()
+
+    def progress(stage: str):
+        with ASK_JOBS_LOCK:
+            ASK_JOBS[job_id]["stage"] = stage
+        log(f"[ask {job_id}] stage={stage} elapsed={time.monotonic()-started:.1f}s")
+
+    try:
+        from mywork_hub.asr import to_wav16k
+        with tempfile.TemporaryDirectory(prefix="voice-ask-") as directory:
+            path = Path(directory) / "question.wav"
+            wav16 = Path(directory) / "question16.wav"
+            path.write_bytes(data)
+            progress("transcribing")
+            to_wav16k(path, wav16)
+            question = "".join(item["text"] for item in transcribe_file(wav16)).strip()
+            if not question:
+                raise ValueError("没听清，请靠近后重新说")
+            log(f"[ask {job_id}] ASR文字：{question}")
+            answer = askmod.answer_question(question, progress=progress)
+            if not answer.strip():
+                raise ValueError("没有收到回答")
+            log(f"[ask {job_id}] 回答：{answer}")
+            with ASK_JOBS_LOCK:
+                ASK_JOBS[job_id]["answer"] = answer if len(answer) <= 384 else answer[:383] + "…"
+            progress("tts")
+            with ASK_JOBS_LOCK:
+                streaming = ASK_JOBS[job_id].get("streaming", False)
+            if streaming:
+                with ASK_AUDIO_CONDITION:
+                    ASK_JOBS[job_id].update(stream_ready=True, chunks=[])
+                    ASK_AUDIO_CONDITION.notify_all()
+                total = 0
+                for chunk in askmod.iter_tts_pcm(answer):
+                    total += len(chunk)
+                    if total > 960000 or len(chunk) % 2:
+                        raise ValueError("流式语音超过30秒或样本不完整")
+                    with ASK_AUDIO_CONDITION:
+                        ASK_JOBS[job_id]["chunks"].append(chunk)
+                        ASK_AUDIO_CONDITION.notify_all()
+                if not total:
+                    raise ValueError("语音合成没有返回音频")
+                with ASK_AUDIO_CONDITION:
+                    mono = b"".join(ASK_JOBS[job_id]["chunks"])
+                    # Retain the old stereo PCM GET contract during staged upgrades.
+                    stereo = bytearray(total*2)
+                    for i in range(0, total, 2):
+                        stereo[i*2:i*2+4] = mono[i:i+2]*2
+                    ASK_JOBS[job_id].update(state="done", stage="done", audio=bytes(stereo))
+                    ASK_AUDIO_CONDITION.notify_all()
+                log(f"[ask {job_id}] 流式单声道播报生成完毕 bytes={total} elapsed={time.monotonic()-started:.1f}s")
+                return
+            audio = askmod.tts(answer)
+            if not audio:
+                raise ValueError("语音合成没有返回音频")
+            tts_path = Path(directory) / "answer.wav"
+            tts_path.write_bytes(audio)
+            result = subprocess.run(
+                ["ffmpeg", "-loglevel", "error", "-i", str(tts_path),
+                 "-ar", "16000", "-ac", "2", "-f", "s16le", "pipe:1"],
+                capture_output=True, check=True, timeout=15,
+            )
+            pcm = result.stdout
+            if not pcm or len(pcm) > 1920000 or len(pcm) % 4:
+                raise ValueError("回答音频格式或长度超出设备限制")
+        with ASK_JOBS_LOCK:
+            ASK_JOBS[job_id].update(state="done", stage="done", audio=pcm)
+        log(f"[ask {job_id}] 播报已生成 {len(pcm)} 字节 total={time.monotonic()-started:.1f}s")
+    except Exception as exc:
+        with ASK_AUDIO_CONDITION:
+            ASK_JOBS[job_id].update(state="failed", error=str(exc)[:120])
+            ASK_AUDIO_CONDITION.notify_all()
+        log(f"[ask {job_id}] 失败：{type(exc).__name__}: {exc}")
 
 
 def ask_tangseng(question: str) -> str:
@@ -395,26 +600,57 @@ def ask_tangseng(question: str) -> str:
         return ""
 
 
-def process(path: Path) -> None:
+def process(item: dict) -> None:
     with PROCESS_LOCK:
         try:
+            path = Path(item["path"])
             log(f"开始处理 {path.name}")
-            meta = pipeline.ingest(path, keep_audio=False)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
+                raise ValueError("stored audio checksum mismatch")
+            # Old firmware has no trusted capture timestamp. Fix the fallback
+            # archive date to receipt time so a retry across midnight cannot
+            # create a second session on a different day.
+            archive_date = item.get("date") or datetime.fromtimestamp(
+                item.get("captured_at") or item["received_at"]).strftime("%Y-%m-%d")
+            meta = pipeline.ingest(path, keep_audio=False, session_id=item["session_id"],
+                                   date=archive_date, captured_at=item.get("captured_at"))
             date = meta["date"]
-            sessions = pipeline.load_day(date)
-            daily = report.write_daily(date, sessions)
-            frag = push.write_memory_fragment(date, daily)
-            log(f"日报已更新：{daily.get('one_liner')}（片段 {frag.name}）")
-
-            # 推送给唐僧
-            result = push.push(date, daily)
-            push.save_push_result(date, result)
-            if result.get("sent"):
-                log("已推送给唐僧")
-            else:
-                log(f"推送失败：{result.get('error') or result.get('stderr')}")
+            recording_inbox().complete(item, date)
+            log(f"录音已归档 id={item['id']} date={date}，日报按窗口合并")
         except Exception as exc:  # noqa: BLE001
-            log(f"处理失败：{exc}")
+            recording_inbox().fail(item, str(exc))
+            log(f"录音处理失败，已持久安排重试 id={item['id']} error={type(exc).__name__}")
+
+
+def recording_worker():
+    while True:
+        try:
+            with ASK_JOBS_LOCK:
+                asking = any(job.get("state") == "working" for job in ASK_JOBS.values())
+            if not asking:
+                inbox = recording_inbox()
+                # Check due reports even under a continuous recording backlog.
+                due = inbox.due_report()
+                if due:
+                    try:
+                        date=due["date"]
+                        daily=report.write_daily(date,pipeline.load_day(date))
+                        push.write_memory_fragment(date,daily)
+                        result=push.push(date,daily)
+                        push.save_push_result(date,result)
+                        if not result.get("sent"):
+                            raise RuntimeError("唐僧通知未确认")
+                        inbox.finish_report(due)
+                    except Exception as exc:
+                        inbox.finish_report(due,str(exc))
+                item=inbox.claim()
+                if item:
+                    process(item)
+                    continue
+        except Exception as exc:
+            log(f"录音后台队列等待重试：{type(exc).__name__}")
+        RECORDING_WAKE.wait(1)
+        RECORDING_WAKE.clear()
 
 
 def main() -> int:
@@ -429,6 +665,9 @@ def main() -> int:
         print("错误：必须设置 DEVICE_TOKEN 环境变量", file=sys.stderr)
         return 2
 
+    restored=recording_inbox().recover(processed_audio_names(cfg.work_dir))
+    log(f"持久录音队列恢复 imported={restored} states={recording_inbox().stats()}")
+    threading.Thread(target=recording_worker,name="recording-worker",daemon=True).start()
     log(f"监听 0.0.0.0:{args.port}  root={cfg.root}  agent={OPENCLAW_AGENT}")
     ThreadingHTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
     return 0

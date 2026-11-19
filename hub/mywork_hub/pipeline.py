@@ -73,16 +73,21 @@ def _speaker_pos(ratio: float) -> str:
     return "M"           # 居中 → 文剑（正对面）
 
 
-def ingest(audio: Path, *, date: str | None = None, keep_audio: bool = True) -> dict:
+def ingest(audio: Path, *, date: str | None = None, keep_audio: bool = True,
+           session_id: str | None = None, captured_at: int | None = None) -> dict:
     audio = Path(audio).expanduser().resolve()
     if not audio.exists():
         raise FileNotFoundError(audio)
 
-    now = datetime.now()
+    now = datetime.fromtimestamp(captured_at) if captured_at else datetime.now()
     date = date or now.strftime("%Y-%m-%d")
-    sid = store.new_session_id(now)
+    sid = session_id or store.new_session_id(now)
+    if not sid or any(c not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for c in sid):
+        raise ValueError("bad session id")
     sdir = store.session_dir(date, sid)
     sdir.mkdir(parents=True, exist_ok=True)
+    if session_id and (sdir / "meta.json").exists() and (sdir / "summary.json").exists():
+        return json.loads((sdir / "meta.json").read_text())
 
     lr = _lr_ratio(audio)
     spk = _speaker_pos(lr)
@@ -109,8 +114,8 @@ def ingest(audio: Path, *, date: str | None = None, keep_audio: bool = True) -> 
             "created_at": now.isoformat(timespec="seconds"),
         }
         _write_transcript(sdir / "transcript.md", [])
+        store.write_json(sdir / "summary.json", {"session_id": sid, "captured_at": now.isoformat(timespec="seconds"), "kept": [], "review": []})
         store.write_json(sdir / "meta.json", meta)
-        store.write_json(sdir / "summary.json", {"session_id": sid, "kept": [], "review": []})
         if not keep_audio:
             wav.unlink(missing_ok=True)
         return meta
@@ -133,7 +138,7 @@ def ingest(audio: Path, *, date: str | None = None, keep_audio: bool = True) -> 
     except Exception as exc:  # noqa: BLE001
         print(f"[pipeline] 声纹识别跳过: {exc}", flush=True)
 
-    store.append_jsonl(sdir / "segments.jsonl", rows)
+    store.atomic_write(sdir / "segments.jsonl", "".join(json.dumps(r, ensure_ascii=False)+"\n" for r in rows))
     _write_transcript(sdir / "transcript.md", rows)
 
     kept = [r for r in rows if r["work"] and r["confidence"] >= cfg.filter_threshold]
@@ -157,15 +162,16 @@ def ingest(audio: Path, *, date: str | None = None, keep_audio: bool = True) -> 
         "llm": {"model": cfg.model_fast},
         "created_at": now.isoformat(timespec="seconds"),
     }
-    store.write_json(sdir / "meta.json", meta)
     store.write_json(
         sdir / "summary.json",
         {
             "session_id": sid,
+            "captured_at": now.isoformat(timespec="seconds"),
             "kept": [_brief(r) for r in kept],
             "review": [_brief(r) for r in review],
         },
     )
+    store.write_json(sdir / "meta.json", meta)
     if not keep_audio:
         wav.unlink(missing_ok=True)
     return meta
@@ -229,6 +235,14 @@ def load_day(date: str) -> list[dict]:
     out = []
     for d in sorted(base.iterdir()):
         f = d / "summary.json"
-        if f.exists():
-            out.append(json.loads(f.read_text(encoding="utf-8")))
-    return out
+        # meta is written last and is the commit marker for a session. A report
+        # can run concurrently with ingest; never publish a partial session.
+        if not (d / "meta.json").is_file():
+            continue
+        try:
+            item = json.loads(f.read_text(encoding="utf-8"))
+            if isinstance(item, dict) and isinstance(item.get("session_id"), str):
+                out.append(item)
+        except (OSError, ValueError):
+            continue
+    return sorted(out, key=lambda item: (item.get("captured_at", item.get("session_id", "")), item.get("session_id", "")))
