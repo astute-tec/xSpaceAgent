@@ -203,7 +203,7 @@ def _split_points(wav: Path, target: int = 50) -> list[float]:
         out = subprocess.run(
             ["ffmpeg", "-hide_banner", "-i", str(wav), "-af", "silencedetect=n=-35dB:d=0.5",
              "-f", "null", "-"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
         ).stderr
     except Exception:
         return []
@@ -218,7 +218,7 @@ def _split_points(wav: Path, target: int = 50) -> list[float]:
             cur = None
     dur = float(subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(wav)],
-        capture_output=True, text=True).stdout.strip() or 0)
+        capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip() or 0)
     points, t = [], target
     while t < dur - 5:
         near = min(sil, key=lambda x: abs(x - t)) if sil else t
@@ -233,7 +233,7 @@ def transcribe_file(wav: Path, language: str = "zh", vocabulary_id: str | None =
     wav = Path(wav)
     dur = float(subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", str(wav)],
-        capture_output=True, text=True).stdout.strip() or 0)
+        capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip() or 0)
     cuts = [0.0] + _split_points(wav) + [dur]
     segs: list[dict] = []
     for i in range(len(cuts) - 1):

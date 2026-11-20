@@ -23,13 +23,13 @@ def _speaker_position(src_wav: Path) -> str:
         out = sp.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
              "-show_entries", "stream=channels", "-of", "csv=p=0", str(src_wav)],
-            capture_output=True, text=True).stdout.strip()
+            capture_output=True, text=True, encoding="utf-8", errors="replace").stdout.strip()
         if out != "2":
             return "M"
         p = sp.run(
             ["ffmpeg", "-hide_banner", "-i", str(src_wav),
              "-af", "ebur128=metadata=1", "-f", "null", "-"],
-            capture_output=True, text=True).stderr
+            capture_output=True, text=True, encoding="utf-8", errors="replace").stderr
     except Exception:
         return "M"
     return "M"  # 用简化法：见 _lr_rms

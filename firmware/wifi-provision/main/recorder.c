@@ -75,6 +75,7 @@ static volatile bool s_screen_off;
 static volatile bool s_manual_screen_off;
 static volatile bool s_pending_start;
 static volatile bool s_ask_pending;
+static volatile bool s_ask_cancel;   /* 下面键取消问答：丢弃在途请求与回答 */
 static volatile bool s_resume_after_ask;
 static volatile bool s_user_stopped;
 static volatile bool s_ptt_pending;
@@ -672,6 +673,7 @@ static void ask_send_task(void *arg)
     int got = 0;
     char job[33] = {0}, url[240];
     snprintf(url, sizeof(url), "%s", s_ask_url_buf[0] ? s_ask_url_buf : s_ask_url);
+    s_ask_cancel = false;
     s_ask_sending = true;
     s_ask_phase = WATCHFACE_THINKING;
     if (!prov_is_connected()) goto done;
@@ -681,6 +683,7 @@ static void ask_send_task(void *arg)
         goto done;
     int64_t deadline = esp_timer_get_time() / 1000 + 240000;
     while (esp_timer_get_time() / 1000 < deadline) {
+        if (s_ask_cancel) { ESP_LOGI(TAG, "ask cancelled by bottom key"); goto done; }
         if (!http_lock_take(30000)) {
             ESP_LOGW(TAG, "ask: waiting for HTTPS timed out");
             goto done;
@@ -710,7 +713,7 @@ static void ask_send_task(void *arg)
         int sent = 0;
         int last_report = 0;
         while (sent < total) {
-            if (esp_timer_get_time() / 1000 > deadline) goto done;
+            if (s_ask_cancel || esp_timer_get_time() / 1000 > deadline) goto done;
             int part = total - sent < 2048 ? total - sent : 2048;
             int wrote = esp_http_client_write(cli, (const char *)wav + sent, part);
             if (wrote <= 0) break;
@@ -728,6 +731,7 @@ static void ask_send_task(void *arg)
         if (esp_http_client_fetch_headers(cli) < 0) goto done;
         int status = esp_http_client_get_status_code(cli);
         ESP_LOGI(TAG, "ask http=%d job=%s", status, job[0] ? job : "new");
+        if (s_ask_cancel) { ESP_LOGI(TAG, "ask cancelled before playback"); goto done; }
         if (status == 200) {
             s_playing=true;
             s_ask_sending=false;
@@ -803,10 +807,12 @@ done:
     if (locked) http_lock_give();
     free(wav);
     s_ask_sending = false;
-    if (!success) {
+    if (!success && !s_ask_cancel) {
         ESP_LOGW(TAG, "ask failed job=%s; UI shows retry", job[0] ? job : "not_submitted");
         s_error_until_ms = esp_timer_get_time() / 1000 + 4000;
         play_question_prompt(no_speech);
+    } else if (s_ask_cancel) {
+        ESP_LOGI(TAG, "ask cancelled; skip error UI");
     }
     s_asking = false;
     ask_resume_recording();
@@ -845,6 +851,22 @@ void recorder_ask(void)
     s_top_ptt_session = true;
     recorder_ptt_begin();
     if (!s_asking && !s_ptt_pending) s_top_ptt_session = false;
+}
+
+/* 下面键取消当前问答流程：聆听中→直接丢弃；已提交→丢弃在途请求与回答。 */
+void recorder_ask_cancel(void)
+{
+    if (s_top_ptt_session) {
+        s_top_ptt_session = false;
+        ESP_LOGI(TAG, "bottom key -> cancel listening, not asking tangseng");
+        recorder_ptt_end(false);
+        return;
+    }
+    if (s_ptt_pending || s_asking || s_ask_sending) {
+        ESP_LOGI(TAG, "bottom key -> cancel ask in flight, drop answer");
+        s_ask_cancel = true;
+        return;
+    }
 }
 
 /* ---------------- 按住说话 ---------------- */
@@ -1245,6 +1267,7 @@ static void button_task(void *arg)
         } else if (was_down && now) {
             was_down = false;
             if (!hold_handled && (ms - down_ms) < 500) {
+                recorder_ask_cancel();        /* 唤醒/问答中：先取消流程，不再问唐僧 */
                 recorder_toggle_screen();     /* 短按：熄屏/亮屏，录音不受影响 */
             }
             if (!hold_handled || !s_busy) s_stop_hold_progress = 0;
@@ -1289,6 +1312,17 @@ static void touch_task(void *arg)
         int down = 0;
         touch_poll_xy(&tx, &ty, &down);
         int64_t ms = esp_timer_get_time() / 1000;
+
+        /* 熄屏时忽略一切触摸（单击唤醒 / 长按问答 / 下滑菜单全部禁用），
+         * 只有下面键能点亮屏幕，避免误触。 */
+        if (s_screen_off) {
+            taps = 0;
+            swiped = false;
+            ptt = false;
+            down_prev = down;
+            vTaskDelay(pdMS_TO_TICKS(30));
+            continue;
+        }
 
         if (down && !down_prev) {
             start_x = tx; start_y = ty; cur_x = tx; cur_y = ty;

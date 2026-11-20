@@ -76,11 +76,13 @@ class DurableInbox:
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.replace(part, path)
-                    fd = os.open(self.root, os.O_RDONLY)
-                    try:
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
+                    # Windows 不支持打开目录句柄（PermissionError），仅 POSIX 做目录 fsync。
+                    if os.name == "posix":
+                        fd = os.open(self.root, os.O_RDONLY)
+                        try:
+                            os.fsync(fd)
+                        finally:
+                            os.close(fd)
                 finally:
                     part.unlink(missing_ok=True)
             db.execute("""INSERT OR IGNORE INTO jobs
