@@ -18,6 +18,7 @@
 #include "freertos/semphr.h"
 #include "freertos/idf_additions.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_heap_caps.h"
 #include "esp_partition.h"
 #include "esp_afe_sr_iface.h"
@@ -40,6 +41,7 @@ static volatile bool s_running;
 static volatile bool s_ready;
 static volatile bool s_reset_requested;
 static volatile uint32_t s_overflows;
+static uint32_t s_max_read_us, s_max_feed_us;
 static void *s_model_storage; /* AFE/model pointers retain this for app lifetime. */
 
 static bool models_move_to_psram(srmodel_list_t *models)
@@ -113,9 +115,11 @@ void afe_log_diagnostics(void)
         if (levels[i] < low) low = levels[i];
         if (levels[i] > high) high = levels[i];
     }
-    ESP_LOGI(TAG, "health feed=%lu fetch=%lu rms=%d..%d overflow=%lu",
+    ESP_LOGI(TAG, "health feed=%lu fetch=%lu rms=%d..%d overflow=%lu read_max_us=%lu feed_max_us=%lu",
              (unsigned long)s_level_seq, (unsigned long)s_fetch_seq,
-             n ? low : 0, high, (unsigned long)s_overflows);
+             n ? low : 0, high, (unsigned long)s_overflows,
+             (unsigned long)__atomic_exchange_n(&s_max_read_us,0,__ATOMIC_RELAXED),
+             (unsigned long)__atomic_exchange_n(&s_max_feed_us,0,__ATOMIC_RELAXED));
 }
 
 int afe_get_level_history(uint16_t *out, int max_items)
@@ -169,6 +173,13 @@ bool afe_read(int16_t *dest, int byte_count)
     return got == need;
 }
 
+static void keep_max(uint32_t *value, uint32_t sample)
+{
+    uint32_t old=__atomic_load_n(value,__ATOMIC_RELAXED);
+    while (sample>old && !__atomic_compare_exchange_n(value,&old,sample,false,
+                                                       __ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+}
+
 static void feed_task(void *arg)
 {
     const int chunk = s_afe->get_feed_chunksize(s_afe_data);
@@ -177,7 +188,9 @@ static void feed_task(void *arg)
     if (!stereo || !mono) { ESP_LOGE(TAG, "feed buf no mem"); vTaskDelete(NULL); return; }
     ESP_LOGI(TAG, "feed ready: chunk=%d (从 2ch 取左声道)", chunk);
     for (;;) {
+        int64_t started=esp_timer_get_time();
         int rc = esp_codec_dev_read(mic_input_dev(), stereo, chunk * 2 * sizeof(int16_t));
+        keep_max(&s_max_read_us,(uint32_t)(esp_timer_get_time()-started));
         if (rc != ESP_CODEC_DEV_OK) { vTaskDelay(pdMS_TO_TICKS(50)); continue; }
         for (int f = 0; f < chunk; f++) mono[f] = stereo[f * 2];   /* 左声道 */
         int64_t sum_sq = 0;
@@ -191,7 +204,9 @@ static void feed_task(void *arg)
         s_level_history[s_level_seq % LEVEL_HISTORY] = (uint16_t)raw_rms;
         s_level_seq++;
         taskEXIT_CRITICAL(&s_level_mux);
+        started=esp_timer_get_time();
         s_afe->feed(s_afe_data, mono);
+        keep_max(&s_max_feed_us,(uint32_t)(esp_timer_get_time()-started));
     }
 }
 

@@ -6,6 +6,7 @@
 #include <string.h>
 #include "esp_log.h"
 #include "esp_attr.h"
+#include "esp_timer.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_tdm.h"
 #include "esp_codec_dev.h"
@@ -28,6 +29,16 @@ static esp_codec_dev_handle_t s_in;
 esp_codec_dev_handle_t mic_input_dev(void) { return s_in; }
 static esp_codec_dev_handle_t s_out;
 static volatile uint32_t s_rx_overflows;
+static uint32_t s_rx_last_irq_us, s_rx_irq_max_gap_us;
+
+static bool IRAM_ATTR rx_received(i2s_chan_handle_t handle, i2s_event_data_t *event, void *arg)
+{
+    uint32_t now=(uint32_t)esp_timer_get_time();
+    if (s_rx_last_irq_us && now-s_rx_last_irq_us>s_rx_irq_max_gap_us)
+        s_rx_irq_max_gap_us=now-s_rx_last_irq_us;
+    s_rx_last_irq_us=now;
+    return false;
+}
 
 static bool IRAM_ATTR rx_queue_overflow(i2s_chan_handle_t handle, i2s_event_data_t *event, void *arg)
 {
@@ -37,7 +48,8 @@ static bool IRAM_ATTR rx_queue_overflow(i2s_chan_handle_t handle, i2s_event_data
 
 void mic_log_diagnostics(void)
 {
-    ESP_LOGI(TAG,"health rx_dma_queue_overflows=%lu",(unsigned long)s_rx_overflows);
+    ESP_LOGI(TAG,"health rx_dma_queue_overflows=%lu irq_max_gap_us=%lu",
+             (unsigned long)s_rx_overflows,(unsigned long)s_rx_irq_max_gap_us);
 }
 
 esp_err_t mic_init(void)
@@ -118,7 +130,7 @@ esp_err_t mic_init(void)
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(s_rx, &tdm_cfg));
-    i2s_event_callbacks_t callbacks={.on_recv_q_ovf=rx_queue_overflow};
+    i2s_event_callbacks_t callbacks={.on_recv=rx_received,.on_recv_q_ovf=rx_queue_overflow};
     ESP_ERROR_CHECK(i2s_channel_register_event_callback(s_rx,&callbacks,NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx));
