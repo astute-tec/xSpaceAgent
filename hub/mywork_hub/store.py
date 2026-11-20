@@ -21,11 +21,13 @@ def atomic_write(path: Path, text: str) -> None:
         os.replace(tmp, path)
         # A completed rename also needs the directory entry committed before
         # the recording worker can acknowledge its durable completion.
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        # Windows 不支持打开目录（PermissionError），仅 POSIX 做目录 fsync。
+        if os.name == "posix":
+            directory = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)

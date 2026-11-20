@@ -45,7 +45,7 @@ def transcribe(wav: Path, language: str = "zh") -> list[dict]:
         "-of", str(out_prefix),
         "-np",
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if proc.returncode != 0:
         raise ASRError(f"whisper 失败: {(proc.stderr or proc.stdout)[-500:]}")
 

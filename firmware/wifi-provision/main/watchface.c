@@ -184,10 +184,7 @@ static void draw_status(face_status_t status)
         line(cx-3,y+8,cx+4,y+8,COLOR_ORANGE,2);
         line(cx+4,y+8,cx-1,y+23,COLOR_ORANGE,2);
     }
-    char percent[16];
-    if (status.percent<0) snprintf(percent,sizeof(percent),"--%%");
-    else snprintf(percent,sizeof(percent),"%d%%",status.percent);
-    ui_text(bx+44,y-3,percent,color,1);
+    /* 电量只显示图标，不显示百分比数字 */
 }
 
 static float level_db(uint16_t raw)

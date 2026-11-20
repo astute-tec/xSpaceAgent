@@ -253,11 +253,12 @@ def _write_library_unlocked(path: Path, lib: dict) -> None:
         fd = -1
         os.replace(temp, path)
         os.chmod(path, 0o600)
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+        if os.name == "posix":       # 目录 fsync 仅 POSIX 支持（Windows 打开目录会 PermissionError）
+            dir_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
     finally:
         if fd >= 0:
             os.close(fd)
