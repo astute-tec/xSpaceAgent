@@ -149,13 +149,13 @@ bool afe_reset_output(uint32_t timeout_ms)
 /* byte_count：字节数（不是采样数），调用方传入的均为字节。
  * 之前参数叫 samples 且内部乘以 sizeof(int16_t)，导致每次读双倍
  * 字节，后半段被下一次调用覆盖，造成音频质量严重下降。*/
-bool afe_read(int16_t *dest, int byte_count)
+bool afe_read_while(int16_t *dest, int byte_count, const volatile bool *active)
 {
     if (!s_ready || !s_ring || !dest || byte_count <= 0) return false;
     size_t need = (size_t)byte_count;   /* 字节数，不再乘以 2 */
     size_t got = 0;
     int wait = 0;
-    while (got < need && wait < 4000) {
+    while (got < need && wait < 4000 && (!active || *active)) {
         size_t item_size;
         uint8_t *data = (uint8_t *)xRingbufferReceiveUpTo(s_ring, &item_size,
                                                           pdMS_TO_TICKS(50), need - got);
@@ -170,7 +170,12 @@ bool afe_read(int16_t *dest, int byte_count)
     if (got < need) {
         memset((uint8_t *)dest + got, 0, need - got);
     }
-    return got == need;
+    return got == need && (!active || *active);
+}
+
+bool afe_read(int16_t *dest, int byte_count)
+{
+    return afe_read_while(dest,byte_count,NULL);
 }
 
 static void keep_max(uint32_t *value, uint32_t sample)

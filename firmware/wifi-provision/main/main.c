@@ -1084,8 +1084,7 @@ static void serial_cli_task(void *arg)
             recorder_stop();
             ESP_LOGI(TAG, "CLI_STOP");
         } else if (!strcmp(line,"KEYBOTTOM")) {
-            extern void recorder_toggle_screen(void);
-            recorder_toggle_screen();
+            recorder_bottom_key();
             ESP_LOGI(TAG,"CLI_KEYBOTTOM");
         } else if (strncmp(line, "KEYTOP", 6) == 0) {
             extern void recorder_top_key(void);
@@ -1101,9 +1100,7 @@ static void serial_cli_task(void *arg)
             recorder_auto_set(on);
             ESP_LOGI(TAG, "CLI_AUTO on=%d", on);
         } else if (strncmp(line, "ASK", 3) == 0) {
-            extern void recorder_ask(void);
-            recorder_ask();
-            ESP_LOGI(TAG, "CLI_ASK");
+            ESP_LOGI(TAG, "CLI_ASK disabled; use KEYTOP twice or wake word");
         } else if (strncmp(line, "REC", 3) == 0) {
             recorder_start();
             ESP_LOGI(TAG, "CLI_REC state=%s", recorder_state());

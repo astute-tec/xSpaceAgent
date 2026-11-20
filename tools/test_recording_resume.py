@@ -25,6 +25,7 @@ harness = r'''
 #include <stdio.h>
 static bool s_user_stopped,s_resume_after_ask,s_pending_start,s_recording,s_busy,s_asking;
 static bool s_available,s_ptt_user_down,s_ptt_pending,s_ptt_active,s_ptt_capture_running;
+static bool s_ask_cancel,s_ptt_preparing;
 static int s_ptt_len, starts, stop_during_delay, task_result=1, reset_ok=1;
 static const char *TAG="test";
 #define pdPASS 1
@@ -45,6 +46,7 @@ harness += r'''
 static void reset(void) {
     s_user_stopped=s_resume_after_ask=s_pending_start=s_recording=s_busy=s_asking=false;
     s_available=true; s_ptt_user_down=s_ptt_pending=s_ptt_active=s_ptt_capture_running=false;
+    s_ask_cancel=s_ptt_preparing=false;
     starts=stop_during_delay=0; task_result=reset_ok=1;
 }
 int main(void) {

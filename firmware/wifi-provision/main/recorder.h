@@ -10,8 +10,10 @@ void recorder_request_start(void);
 void recorder_top_key(void);   /* 上面键：设置页→回主界面 / 单击录音 / 双击问答 */  /* 上面键短按：仅开始录音 */
 void recorder_ask(void);
 void recorder_ask_wake(void);
-void recorder_ptt_begin(void);          /* 手指按下：开始缓冲问题 */
-void recorder_ptt_end(bool send);        /* 松手：true=发送 false=取消 */
+void recorder_ask_cancel(void);
+void recorder_bottom_key(void);         /* 问答取消；其他状态切换屏幕 */
+void recorder_ptt_begin(void);          /* 仅授权的按键/唤醒词入口调用 */
+void recorder_ptt_end(bool send);        /* 上键提交；取消丢弃缓冲 */
 int recorder_grab_pcm(int16_t *buf, int max_bytes, int seconds);
 bool recorder_is_busy(void);   /* 录音/问答/收尾中 */
 bool recorder_question_active(void);

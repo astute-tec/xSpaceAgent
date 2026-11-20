@@ -16,6 +16,7 @@ typedef struct {
     SemaphoreHandle_t finished;
     uint8_t *storage;
     bool mono;
+    const volatile bool *cancelled;
     volatile bool input_done;
     volatile bool failed;
     int played;
@@ -27,7 +28,7 @@ static void speaker_task(void *arg)
     uint8_t *raw=heap_caps_malloc(2048,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     int16_t *stereo=heap_caps_malloc(4096,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     if (!raw || !stereo) p->failed=true;
-    while (!p->failed) {
+    while (!p->failed && !(p->cancelled && *p->cancelled)) {
         size_t n=xStreamBufferReceive(p->stream,raw,2048,pdMS_TO_TICKS(200));
         if (!n) { if (p->input_done) break; else continue; }
         if (n%(p->mono ? 2 : 4)) { p->failed=true; break; }
@@ -37,6 +38,7 @@ static void speaker_task(void *arg)
             for (size_t i=0;i<n/2;i++) stereo[i*2]=stereo[i*2+1]=in[i];
             output=stereo; bytes=n*2;
         }
+        if (p->cancelled && *p->cancelled) break;
         if (mic_play(output,bytes)!=bytes) { p->failed=true; break; }
         p->played+=n;
     }
@@ -45,12 +47,15 @@ static void speaker_task(void *arg)
     vTaskDelete(NULL);
 }
 
-bool audio_play_http(esp_http_client_handle_t client, bool mono, int *played)
+bool audio_play_http(esp_http_client_handle_t client, bool mono, int *played,
+                     const volatile bool *cancelled)
 {
     if (played) *played=0;
+    if (cancelled && *cancelled) return false;
     playback_t *p=calloc(1,sizeof(*p));
     if (!p) return false;
     p->mono=mono;
+    p->cancelled=cancelled;
     p->storage=heap_caps_malloc(PLAYBACK_BUFFER_BYTES+1,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
     p->finished=xSemaphoreCreateBinary();
     uint8_t *input=heap_caps_malloc(4096+4,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
@@ -61,7 +66,7 @@ bool audio_play_http(esp_http_client_handle_t client, bool mono, int *played)
     started=true;
     int total=0, tail=0, align=mono ? 2 : 4;
     int64_t deadline=esp_timer_get_time()/1000+120000;
-    while (!p->failed && esp_timer_get_time()/1000<deadline) {
+    while (!p->failed && !(cancelled && *cancelled) && esp_timer_get_time()/1000<deadline) {
         int got=esp_http_client_read(client,(char *)input+tail,4096-tail);
         if (got<=0) {
             complete=got==0 && esp_http_client_is_complete_data_received(client) && tail==0;
@@ -72,7 +77,7 @@ bool audio_play_http(esp_http_client_handle_t client, bool mono, int *played)
         int available=got+tail;
         int n=available-available%align;
         int sent=0;
-        while (sent<n && !p->failed && esp_timer_get_time()/1000<deadline) {
+        while (sent<n && !p->failed && !(cancelled && *cancelled) && esp_timer_get_time()/1000<deadline) {
             sent+=xStreamBufferSend(p->stream,input+sent,n-sent,pdMS_TO_TICKS(500));
         }
         if (sent!=n) break;
@@ -82,11 +87,12 @@ bool audio_play_http(esp_http_client_handle_t client, bool mono, int *played)
     }
 cleanup:
     if (started) {
+        if (cancelled && *cancelled) p->failed=true; /* Drop buffered old answer. */
         p->input_done=true;
         /* Speaker can need up to the bounded buffer duration to drain. */
         xSemaphoreTake(p->finished,portMAX_DELAY);
     }
-    bool success=started && complete && !p->failed && p->played>0;
+    bool success=started && complete && !p->failed && p->played>0 && !(cancelled && *cancelled);
     if (played) *played=p->played;
     if (p->stream) vStreamBufferDelete(p->stream);
     if (p->finished) vSemaphoreDelete(p->finished);

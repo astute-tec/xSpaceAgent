@@ -5,8 +5,9 @@
  *   上面键短按       开始录音（录音中再按无效；停止靠下面键长按）
  *   下面键短按       熄屏 / 亮屏（录音不受影响）
  *   下面键长按 3 秒  保存尾段并停止录音
- *   屏幕轻点         唤醒屏幕（不改变录音）；双击进入问答
- *   屏幕按住 >0.26s  开始聆听；松开继续听，上键单击提交给唐僧
+ *   屏幕触摸         仅表盘/设置操作；长按、双击均不进入问答
+ *   上面键双击       开始聆听；上键单击提交给唐僧
+ *   问答时下面键     按下即取消聆听/请求/播报，恢复日常录音
  *   屏幕顶部下滑     打开设置菜单（WiFi / 声纹）
  *   喊"你好小智"     唤醒问答（AFE 内置唤醒）
  */
@@ -17,6 +18,8 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "lwip/sockets.h"
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
 #include "esp_log.h"
@@ -74,8 +77,11 @@ static volatile bool s_auto = true;      /* 全天自动采集（默认开，rec
 static volatile bool s_screen_off;
 static volatile bool s_manual_screen_off;
 static volatile bool s_pending_start;
-static volatile bool s_ask_pending;
 static volatile bool s_ask_cancel;   /* 下面键取消问答：丢弃在途请求与回答 */
+static volatile bool s_cancel_capture;
+static volatile bool s_ptt_preparing;
+static SemaphoreHandle_t s_ask_client_lock;
+static esp_http_client_handle_t s_ask_client;
 static volatile bool s_resume_after_ask;
 static volatile bool s_user_stopped;
 static volatile bool s_ptt_pending;
@@ -115,6 +121,8 @@ static void show_asking(void);
 static void touch_task(void *arg);
 static void sync_voiceprint_slots(void);
 static void recorder_start_impl(bool during_question);
+static void cancel_capture_poll(void);
+static void cancel_question_http(void);
 extern const uint8_t no_speech_start[] asm("_binary_no_speech_pcm_start");
 extern const uint8_t no_speech_end[] asm("_binary_no_speech_pcm_end");
 extern const uint8_t ask_failed_start[] asm("_binary_ask_failed_pcm_start");
@@ -123,11 +131,12 @@ extern const uint8_t ask_failed_end[] asm("_binary_ask_failed_pcm_end");
 /* 两条本地语音提示，离线也能明确反馈；只在已停止采集后播放。 */
 static void play_question_prompt(bool no_speech)
 {
+    if (s_ask_cancel) return;
     const uint8_t *p = no_speech ? no_speech_start : ask_failed_start;
     const uint8_t *end = no_speech ? no_speech_end : ask_failed_end;
     s_playing = true;
     mic_set_playback_vol(100);
-    while (p < end) {
+    while (p < end && !s_ask_cancel) {
         int n = end - p > 6400 ? 6400 : (int)(end - p);
         if (mic_play(p, n) != n) break;
         p += n;
@@ -214,7 +223,7 @@ static void recorder_ui_task(void *arg)
                                  power.valid && power.battery_present ? power.percent : -1,
                                  power.valid && power.charging,power.valid && power.external_power);
         }
-        bool animate = s_recording || s_ptt_active || s_ask_capturing ||
+        bool animate = s_recording || s_asking || s_ptt_active || s_ask_capturing ||
                        s_stop_hold_progress > 0 || watchface_has_answer();
         if (!s_screen_off && !menu_active() && !prov_ui_active() && display_frame_take(0)) {
             watchface_set_recording(s_recording);
@@ -225,6 +234,8 @@ static void recorder_ui_task(void *arg)
                 : (s_ask_sending ? WATCHFACE_SENDING
                 : (s_asking ? s_ask_phase
                 : (s_recording ? WATCHFACE_RECORDING : WATCHFACE_IDLE))))));
+            if (s_ask_cancel && s_asking)
+                state=s_recording ? WATCHFACE_RECORDING : WATCHFACE_IDLE;
             int count = 0;
             if (state == WATCHFACE_RECORDING || state == WATCHFACE_LISTENING)
                 count = afe_get_level_history(levels, (int)(sizeof(levels) / sizeof(levels[0])));
@@ -394,10 +405,7 @@ static void record_task(void *arg)
     s_len[0] = s_len[1] = 0;
     queue_flush_async();
     s_busy = false;
-    if (s_ask_pending) {
-        s_ask_pending = false;
-        recorder_ask();
-    } else if (s_ptt_pending) {
+    if (s_ptt_pending) {
         ptt_start_after_record();
     } else {
         show_idle();
@@ -566,7 +574,11 @@ void recorder_auto_set(bool on)
 
 bool recorder_auto_enabled(void) { return s_auto; }
 bool recorder_is_busy(void) { return s_recording || s_busy || s_asking; }
-bool recorder_question_active(void) { return s_asking || s_ptt_pending; }
+bool recorder_question_active(void)
+{
+    return s_asking || s_ptt_pending || s_ptt_preparing || s_top_ptt_session ||
+           s_cancel_capture || s_wake_requested;
+}
 
 const char *recorder_state(void)
 {
@@ -660,6 +672,34 @@ static void flush_task(void *arg)
 
 /* ---------------- 语音问答 ---------------- */
 
+static void publish_question_client(esp_http_client_handle_t client)
+{
+    xSemaphoreTake(s_ask_client_lock,portMAX_DELAY);
+    s_ask_client=client;
+    xSemaphoreGive(s_ask_client_lock);
+}
+
+static void close_question_client(esp_http_client_handle_t client)
+{
+    /* Detach before closing, so a cancelling task cannot touch a freed handle
+     * or shut down a socket descriptor reused by another request. */
+    xSemaphoreTake(s_ask_client_lock,portMAX_DELAY);
+    if (s_ask_client==client) s_ask_client=NULL;
+    xSemaphoreGive(s_ask_client_lock);
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+}
+
+static void cancel_question_http(void)
+{
+    if (!s_ask_client_lock || xSemaphoreTake(s_ask_client_lock,0)!=pdTRUE) return;
+    if (s_ask_client) {
+        int fd=esp_http_client_get_socket(s_ask_client);
+        if (fd>=0) shutdown(fd,SHUT_RDWR); /* Wake blocking TLS/read; owner cleans up. */
+    }
+    xSemaphoreGive(s_ask_client_lock);
+}
+
 /* 发送已录好的问题并播放回答 */
 extern bool prov_is_connected(void);
 
@@ -673,9 +713,9 @@ static void ask_send_task(void *arg)
     int got = 0;
     char job[33] = {0}, url[240];
     snprintf(url, sizeof(url), "%s", s_ask_url_buf[0] ? s_ask_url_buf : s_ask_url);
-    s_ask_cancel = false;
     s_ask_sending = true;
     s_ask_phase = WATCHFACE_THINKING;
+    if (s_ask_cancel) goto done;
     if (!prov_is_connected()) goto done;
     /* AFE is free once question capture stops; keep recording the room. */
     if (!s_user_stopped) recorder_start_impl(true);
@@ -684,19 +724,23 @@ static void ask_send_task(void *arg)
     int64_t deadline = esp_timer_get_time() / 1000 + 240000;
     while (esp_timer_get_time() / 1000 < deadline) {
         if (s_ask_cancel) { ESP_LOGI(TAG, "ask cancelled by bottom key"); goto done; }
-        if (!http_lock_take(30000)) {
+        int64_t lock_deadline=esp_timer_get_time()/1000+30000;
+        while (!s_ask_cancel && esp_timer_get_time()/1000<lock_deadline &&
+               !(locked=http_lock_take(100))) {}
+        if (!locked) {
             ESP_LOGW(TAG, "ask: waiting for HTTPS timed out");
             goto done;
         }
-        locked = true;
+        if (s_ask_cancel) goto done;
         esp_http_client_config_t cfg = {
             .url = url,
             .method = job[0] ? HTTP_METHOD_GET : HTTP_METHOD_POST,
-            .timeout_ms = job[0] ? 15000 : 60000,
+            .timeout_ms = 10000, /* Bound uninterruptible connect/header setup. */
             .crt_bundle_attach = esp_crt_bundle_attach,
         };
         cli = esp_http_client_init(&cfg);
         if (!cli) goto done;
+        if (s_ask_cancel) goto done;
         esp_http_client_set_header(cli, "Content-Type", "audio/ogg");
         esp_http_client_set_header(cli, "X-Async-Response", "1");
         esp_http_client_set_header(cli, "X-Stream-Audio", "1");
@@ -709,6 +753,11 @@ static void ask_send_task(void *arg)
         int total = job[0] ? 0 : (int)question_bytes;
         ESP_LOGI(TAG, "ask opening %s bytes=%d", job[0] ? "poll" : "upload", total);
         if (esp_http_client_open(cli, total) != ESP_OK) goto done;
+        /* open() may close/recreate its socket internally on setup failure.
+         * Publish only a connected, stable socket for cross-task shutdown. */
+        publish_question_client(cli);
+        if (s_ask_cancel) goto done;
+        esp_http_client_set_timeout_ms(cli,job[0] ? 15000 : 60000);
         http_low_latency(cli);
         int sent = 0;
         int last_report = 0;
@@ -737,7 +786,7 @@ static void ask_send_task(void *arg)
             s_ask_sending=false;
             show_playing();
             mic_set_playback_vol(100);
-            success=audio_play_http(cli,fetch_audio,&got);
+            success=audio_play_http(cli,fetch_audio,&got,&s_ask_cancel);
             mic_set_playback_vol(0);
             s_playing=false;
             ESP_LOGI(TAG,"answer streamed playback bytes=%d complete=%d",got,success);
@@ -745,6 +794,7 @@ static void ask_send_task(void *arg)
         }
         char body[2048] = {0};
         int length = esp_http_client_read_response(cli, body, sizeof(body) - 1);
+        if (s_ask_cancel) goto done;
         if (status != 202 || length <= 0 || !esp_http_client_is_complete_data_received(cli)) {
             ESP_LOGW(TAG, "ask failed http=%d detail=%.*s", status, length > 0 ? length : 0, body);
             no_speech = status == 422 && strstr(body, "transcribing") != NULL;
@@ -760,7 +810,7 @@ static void ask_send_task(void *arg)
         bool valid = cJSON_IsTrue(ok) && cJSON_IsString(id) && strlen(id->valuestring) == 32 &&
                      strspn(id->valuestring, "0123456789abcdef") == 32;
         if (valid && job[0] && strcmp(job, id->valuestring)) valid = false;
-        if (valid) {
+        if (valid && !s_ask_cancel) {
             snprintf(job, sizeof(job), "%s", id->valuestring);
             if (cJSON_IsString(answer) && answer->valuestring[0]) {
                 bool first_text = !watchface_has_answer();
@@ -792,8 +842,7 @@ static void ask_send_task(void *arg)
         snprintf(url, sizeof(url), "%s/%s%s", s_ask_url_buf[0] ? s_ask_url_buf : s_ask_url,
                  job,fetch_audio ? "/audio" : "");
         s_ask_sending = false;
-        esp_http_client_close(cli);
-        esp_http_client_cleanup(cli);
+        close_question_client(cli);
         cli = NULL;
         http_lock_give();
         locked = false;
@@ -801,8 +850,7 @@ static void ask_send_task(void *arg)
     }
 done:
     if (cli) {
-        esp_http_client_close(cli);
-        esp_http_client_cleanup(cli);
+        close_question_client(cli);
     }
     if (locked) http_lock_give();
     free(wav);
@@ -813,6 +861,10 @@ done:
         play_question_prompt(no_speech);
     } else if (s_ask_cancel) {
         ESP_LOGI(TAG, "ask cancelled; skip error UI");
+    }
+    if (s_ask_cancel) {
+        watchface_set_answer("");
+        s_error_until_ms=0;
     }
     s_asking = false;
     ask_resume_recording();
@@ -846,7 +898,8 @@ static void handle_wake_request(void)
 /* 所有入口均听到上键明确提交，绝不在松屏或固定秒数后静默提交。 */
 void recorder_ask(void)
 {
-    if (!s_available || s_asking || s_ptt_pending || menu_active()) return;
+    if (!s_available || recorder_question_active() || menu_active()) return;
+    s_ask_cancel=false; /* Only a genuinely new session may clear cancellation. */
     watchface_set_answer("");
     s_top_ptt_session = true;
     recorder_ptt_begin();
@@ -856,17 +909,37 @@ void recorder_ask(void)
 /* 下面键取消当前问答流程：聆听中→直接丢弃；已提交→丢弃在途请求与回答。 */
 void recorder_ask_cancel(void)
 {
-    if (s_top_ptt_session) {
-        s_top_ptt_session = false;
-        ESP_LOGI(TAG, "bottom key -> cancel listening, not asking tangseng");
-        recorder_ptt_end(false);
-        return;
-    }
-    if (s_ptt_pending || s_asking || s_ask_sending) {
-        ESP_LOGI(TAG, "bottom key -> cancel ask in flight, drop answer");
-        s_ask_cancel = true;
-        return;
-    }
+    if (!recorder_question_active()) return;
+    s_ask_cancel=true;
+    s_wake_requested=false;
+    taskENTER_CRITICAL(&s_top_click_mux);
+    s_top_clicks=0;
+    taskEXIT_CRITICAL(&s_top_click_mux);
+    if (s_top_ptt_session || s_ptt_active || s_ptt_pending || s_ptt_preparing)
+        s_cancel_capture=true;
+    s_top_ptt_session=false;
+    s_ptt_user_down=false;
+    s_ptt_active=false;
+    watchface_set_answer("");
+    s_error_until_ms=0;
+    if (s_playing) mic_set_playback_vol(0);
+    cancel_question_http();
+    ESP_LOGI(TAG,"bottom key -> cancel question; discard pending answer");
+}
+
+static void cancel_capture_poll(void)
+{
+    if (!s_cancel_capture || s_ptt_capture_running || s_ptt_pending || s_ptt_preparing) return;
+    s_cancel_capture=false;
+    s_ptt_len=0;
+    s_asking=false;
+    ask_resume_recording();
+}
+
+void recorder_bottom_key(void)
+{
+    if (recorder_question_active()) recorder_ask_cancel();
+    else recorder_toggle_screen();
 }
 
 /* ---------------- 按住说话 ---------------- */
@@ -876,8 +949,8 @@ static void ptt_capture_task(void *arg)
     int want = OUT_BYTES_PER_SEC / 10;
     int64_t start = esp_timer_get_time() / 1000;
     int last_draw = 0;
-    while (s_ptt_active && s_ptt_len + want <= ASK_BYTES) {
-        int got = afe_read((int16_t *)(s_askbuf + s_ptt_len), want) ? want : -1;
+    while (s_ptt_active && !s_ask_cancel && s_ptt_len + want <= ASK_BYTES) {
+        int got = afe_read_while((int16_t *)(s_askbuf + s_ptt_len),want,&s_ptt_active) ? want : -1;
         if (got > 0) s_ptt_len += got;
         int held = (int)(esp_timer_get_time() / 1000 - start);
         if (held - last_draw >= 200) {
@@ -894,17 +967,26 @@ static void ptt_capture_task(void *arg)
 
 static void ptt_start_after_record(void)
 {
+    s_ptt_preparing=true;
     s_ptt_pending = false;
-    if (!s_ptt_user_down) {
+    if (!s_ptt_user_down || s_ask_cancel) {
+        s_ptt_preparing=false;
         s_asking = false;
         show_idle();
         ask_resume_recording();
         return;
     }
     if (!s_available || !afe_reset_output(1200)) {
+        s_ptt_preparing=false;
         ESP_LOGE(TAG, "AFE reset timeout before deferred ptt");
         s_asking = false;
         show_idle();
+        ask_resume_recording();
+        return;
+    }
+    if (!s_ptt_user_down || s_ask_cancel) {
+        s_ptt_preparing=false;
+        s_asking=false;
         ask_resume_recording();
         return;
     }
@@ -921,11 +1003,12 @@ static void ptt_start_after_record(void)
         show_idle();
         ask_resume_recording();
     }
+    s_ptt_preparing=false;
 }
 
 void recorder_ptt_begin(void)
 {
-    if (!s_available || s_asking || menu_active()) return;
+    if (!s_available || s_asking || s_ask_cancel || menu_active()) return;
     s_user_stopped = false;
     s_resume_after_ask = true;
     s_ptt_user_down = true;
@@ -942,7 +1025,9 @@ void recorder_ptt_begin(void)
         ESP_LOGI(TAG, "ptt queued during recorder finalization");
         return;
     }
-    if (!afe_reset_output(1200)) {
+    s_ptt_preparing=true;
+    if (!afe_reset_output(1200) || s_ask_cancel) {
+        s_ptt_preparing=false;
         ESP_LOGE(TAG, "AFE reset timeout before ptt");
         s_ptt_user_down = false;
         ask_resume_recording();
@@ -958,8 +1043,10 @@ void recorder_ptt_begin(void)
         s_asking = false;
         ESP_LOGE(TAG, "ptt task create failed");
         ask_resume_recording();
+        s_ptt_preparing=false;
         return;
     }
+    s_ptt_preparing=false;
     ESP_LOGI(TAG, "ptt begin");
 }
 
@@ -977,7 +1064,7 @@ void recorder_ptt_end(bool send)
         ESP_LOGE(TAG, "question capture did not stop; keeping buffer owned");
         return;
     }
-    if (!send) {
+    if (!send || s_ask_cancel) {
         ESP_LOGI(TAG, "ptt cancelled (%d bytes)", s_ptt_len);
         s_asking = false;
         show_idle();
@@ -1264,16 +1351,19 @@ static void button_task(void *arg)
             was_down = true;
             down_ms = ms;
             hold_handled = false;
+            if (recorder_question_active()) {
+                recorder_ask_cancel(); /* Press edge, not release or long-hold. */
+                hold_handled=true;
+            }
         } else if (was_down && now) {
             was_down = false;
             if (!hold_handled && (ms - down_ms) < 500) {
-                recorder_ask_cancel();        /* 唤醒/问答中：先取消流程，不再问唐僧 */
-                recorder_toggle_screen();     /* 短按：熄屏/亮屏，录音不受影响 */
+                recorder_bottom_key();
             }
             if (!hold_handled || !s_busy) s_stop_hold_progress = 0;
         }
 
-        if (was_down && s_recording) {
+        if (was_down && !hold_handled && s_recording) {
             int64_t held = ms - down_ms;
             s_stop_hold_progress = held >= 3000 ? 3000 : (int)held;
             if (s_recording) {
@@ -1288,6 +1378,8 @@ static void button_task(void *arg)
         } else if (s_stop_hold_progress < 3000 || !s_busy) {
             s_stop_hold_progress = 0;
         }
+        if (s_ask_cancel) cancel_question_http();
+        cancel_capture_poll();
         if (s_wake_requested) handle_wake_request();
         axp_poll_key();
         if (menu_active()) menu_poll();
@@ -1305,7 +1397,6 @@ static void touch_task(void *arg)
     int start_x = 0, start_y = 0, cur_x = 0, cur_y = 0;
     int64_t down_ms = 0;
     bool swiped = false;
-    bool ptt = false;
 
     for (;;) {
         uint16_t tx = 0, ty = 0;
@@ -1318,7 +1409,6 @@ static void touch_task(void *arg)
         if (s_screen_off) {
             taps = 0;
             swiped = false;
-            ptt = false;
             down_prev = down;
             vTaskDelay(pdMS_TO_TICKS(30));
             continue;
@@ -1328,18 +1418,11 @@ static void touch_task(void *arg)
             start_x = tx; start_y = ty; cur_x = tx; cur_y = ty;
             down_ms = ms;
             swiped = false;
-            ptt = false;
         }
         if (down) { cur_x = tx; cur_y = ty; }
 
-        /* 按住超过 260ms → 进入"按住说话"（顶部区域留给下滑菜单） */
-        if (down && !swiped && !ptt && !menu_active() && (ms - down_ms) >= 260 && start_y > 120) {
-            ptt = true;
-            recorder_ask();
-        }
-
         /* 顶部下滑 → 设置菜单 */
-        if (down && !swiped && !ptt && start_y < 140 && (cur_y - start_y) > 60) {
+        if (down && !swiped && start_y < 140 && (cur_y - start_y) > 60) {
             swiped = true;
             ESP_LOGI(TAG, "swipe down -> open menu");
             menu_open();
@@ -1353,11 +1436,7 @@ static void touch_task(void *arg)
         }
 
         if (!down && down_prev) {
-            if (ptt) {
-                /* 松屏仍保持聆听；仅上键单击提交。 */
-                ptt = false;
-                taps = 0;
-            } else if (!swiped) {
+            if (!swiped) {
                 if (menu_active()) {
                     menu_tap(cur_x, cur_y);
                 } else {
@@ -1376,16 +1455,12 @@ static void touch_task(void *arg)
         }
         down_prev = down;
 
-        /* 单击只唤醒屏幕；双击进入在线语音问答。 */
-        if (taps == 1 && ms - first_ms > 700) {
+        /* All screen taps are display-only; voice entry is key double/wake word. */
+        if (taps >= 1 && ms - first_ms > 700) {
             ESP_LOGI(TAG, "tap -> wake display");
             watchface_set_answer("");
             screen_wake();
             if (!s_recording && !s_busy && !s_asking) show_idle();
-            taps = 0;
-        } else if (taps == 2 && ms - first_ms > 700) {
-            ESP_LOGI(TAG, "double tap -> ask");
-            if (!s_recording && !s_busy && !s_asking) recorder_ask();
             taps = 0;
         }
         vTaskDelay(pdMS_TO_TICKS(30));
@@ -1475,6 +1550,11 @@ void recorder_init(const char *hub_ip, int hub_port)
     }
 
     menu_init();
+    s_ask_client_lock=xSemaphoreCreateMutex();
+    if (!s_ask_client_lock) {
+        ESP_LOGE(TAG,"question transport lock unavailable; recorder disabled");
+        return;
+    }
     if (queue_init() != ESP_OK) {
         ESP_LOGE(TAG, "storage queue unavailable; recorder disabled");
         return;
