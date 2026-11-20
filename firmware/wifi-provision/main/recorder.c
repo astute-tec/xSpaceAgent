@@ -82,7 +82,7 @@ static volatile bool s_ptt_user_down;
 
 static uint8_t *s_askbuf;                /* 问题 / 声纹样本缓冲 */
 
-static char s_hub_url[192] = "http://192.168.2.27:8765/upload";
+static char s_hub_url[192] = "https://xiaozhi.halmir.top/v1/upload";
 static char s_token[80];
 static char s_ask_url[192];
 static char s_ask_url_buf[192];
@@ -282,7 +282,7 @@ static void save_task(void *arg)
         while ((err=queue_save(s_seg[m.idx], m.len, m.captured_at)) != ESP_OK) {
             ESP_LOGE(TAG, "segment save failed: idx=%d len=%d err=%d; retaining RAM buffer", m.idx, m.len, err);
             s_recording=false;
-            watchface_set_answer("录音保存失败，请联网补传并检查剩余空间");
+            watchface_set_answer(queue_save_error());
             s_error_until_ms=esp_timer_get_time()/1000+12000;
             queue_flush_async();
             vTaskDelay(pdMS_TO_TICKS(5000));
@@ -581,6 +581,7 @@ void recorder_log_diagnostics(void)
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), s_screen_off,
              s_manual_screen_off, watchface_has_answer());
     afe_log_diagnostics();
+    mic_log_diagnostics();
     display_log_diagnostics();
     queue_log_storage();
 }

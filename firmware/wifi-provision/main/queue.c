@@ -27,11 +27,13 @@
 #include "recorder.h"
 #include "menu.h"
 #include "recording_codec.h"
+#include "recording_integrity.h"
 #include "psa/crypto.h"
 
 static const char *TAG = "queue";
 static int upload_file(const char *path, const char *url, const char *token);
 #define MOUNT "/fat"
+#define RECORDING_DIR MOUNT "/rec"
 static wl_handle_t s_wlh = WL_INVALID_HANDLE;
 static SemaphoreHandle_t s_fs_lock;
 static SemaphoreHandle_t s_http_lock;
@@ -40,6 +42,9 @@ static volatile bool s_flush_requested;
 static char s_uploading_name[64];
 static wifi_ps_type_t s_http_previous_ps;
 static bool s_http_restore_ps;
+static const char *s_save_error = "录音保存失败，尾段仅在内存，请勿关机";
+
+const char *queue_save_error(void) { return s_save_error; }
 
 #define MAX_QUEUE_FILES 2048
 #define QUEUE_RESERVE_BYTES (1024 * 1024)
@@ -58,6 +63,7 @@ typedef struct {
 
 static bool is_wav_name(const char *name)
 {
+    if (name && strrchr(name, '/')) name=strrchr(name, '/')+1;
     size_t n = name ? strlen(name) : 0;
     return n > 6 && strncmp(name, "q_", 2) == 0 &&
         (strcmp(name + n - 4, ".wav") == 0 || (n > 7 && strcmp(name+n-5, ".opus") == 0));
@@ -65,6 +71,7 @@ static bool is_wav_name(const char *name)
 
 static unsigned long name_sequence(const char *name)
 {
+    if (name && strrchr(name, '/')) name=strrchr(name, '/')+1;
     if (!name || strncmp(name, "q_", 2) != 0) return 0;
     return strtoul(name + 2, NULL, 10);
 }
@@ -78,23 +85,77 @@ static int entry_compare(const void *a, const void *b)
     return strcmp(ea->name, eb->name);
 }
 
+typedef void (*file_visitor_t)(const char *relative, const char *path, void *arg);
+
+/* New recordings live in a growable subdirectory. Keep reading the legacy root
+ * without moving/deleting it, and preserve basename-based server segment IDs. */
+static void visit_recording_files(file_visitor_t visitor, void *arg)
+{
+    const char *prefixes[]={"", "rec/"};
+    for (unsigned i=0; i<sizeof(prefixes)/sizeof(prefixes[0]); i++) {
+        char folder[32];
+        snprintf(folder,sizeof(folder),MOUNT "/%s",prefixes[i]);
+        DIR *d=opendir(folder);
+        if (!d) continue;
+        struct dirent *e;
+        while ((e=readdir(d))) {
+            if (e->d_name[0]=='.' || e->d_type==DT_DIR) continue;
+            char relative[64],path[96];
+            int n=snprintf(relative,sizeof(relative),"%s%s",prefixes[i],e->d_name);
+            if (n<0 || n>=(int)sizeof(relative)) continue;
+            snprintf(path,sizeof(path),MOUNT "/%s",relative);
+            visitor(relative,path,arg);
+        }
+        closedir(d);
+    }
+}
+
+typedef struct { queue_entry_t *entries; int count; int max; } collect_t;
+static void collect_file(const char *relative, const char *path, void *arg)
+{
+    collect_t *c=arg;
+    if (!is_wav_name(relative) || c->count>=c->max) return;
+    queue_entry_t *entry=&c->entries[c->count++];
+    snprintf(entry->name,sizeof(entry->name),"%s",relative);
+    entry->seq=name_sequence(relative);
+}
+
 static int collect_entries(queue_entry_t *entries, int max)
 {
-    DIR *d = opendir(MOUNT);
-    if (!d) return 0;
-    int n = 0;
-    struct dirent *e;
-    while ((e = readdir(d)) && n < max) {
-        if (!is_wav_name(e->d_name)) continue;
-        size_t name_len = strnlen(e->d_name, sizeof(entries[n].name));
-        if (name_len >= sizeof(entries[n].name)) continue;
-        memcpy(entries[n].name, e->d_name, name_len + 1);
-        entries[n].seq = name_sequence(e->d_name);
-        n++;
+    collect_t c={.entries=entries,.max=max};
+    visit_recording_files(collect_file,&c);
+    qsort(entries,c.count,sizeof(entries[0]),entry_compare);
+    return c.count;
+}
+
+static bool ensure_recording_directory(void)
+{
+    struct stat st;
+    if (stat(RECORDING_DIR,&st)==0) return S_ISDIR(st.st_mode);
+    if (mkdir(RECORDING_DIR,0755)==0) return true;
+    ESP_LOGE(TAG,"RECORDING_DIRECTORY unavailable errno=%d; preserving existing files",errno);
+    return false;
+}
+
+static void recover_complete_part(const char *relative, const char *path, void *unused)
+{
+    const char *base=strrchr(relative,'/');
+    base=base?base+1:relative;
+    size_t length=strlen(base);
+    if (length<12 || strncmp(base,"q_",2) || strcmp(base+length-10,".opus.part")) return;
+    if (!recording_file_complete(path)) {
+        ESP_LOGW(TAG,"incomplete temporary recording retained: %s",path);
+        return;
     }
-    closedir(d);
-    qsort(entries, n, sizeof(entries[0]), entry_compare);
-    return n;
+    char final[96];
+    snprintf(final,sizeof(final),RECORDING_DIR "/%.*s",(int)length-5,base);
+    /* Never replace another recording, even when interrupted migration is retried. */
+    if (access(final,F_OK)==0) {
+        ESP_LOGW(TAG,"recovery destination exists; keeping both: %s",path);
+        return;
+    }
+    if (rename(path,final)==0) ESP_LOGI(TAG,"recovered complete recording: %s",final);
+    else ESP_LOGW(TAG,"temporary recovery rename failed errno=%d: %s",errno,path);
 }
 
 static uint32_t next_sequence_locked(void)
@@ -127,6 +188,7 @@ static bool ensure_space_locked(uint64_t needed)
     if (esp_vfs_fat_info(MOUNT, &total, &freeb) != ESP_OK) return false;
     if (freeb >= needed + QUEUE_RESERVE_BYTES) return true;
     ESP_LOGE(TAG, "STORAGE_FULL free=%llu needed=%llu; preserving all unconfirmed recordings", freeb, needed);
+    s_save_error="存储空间不足，录音已暂停，尾段仅在内存，请勿关机";
     return false;
 }
 
@@ -151,6 +213,8 @@ esp_err_t queue_init(void)
         ESP_LOGI(TAG, "fatfs ready: %llu MB total, %llu MB free",
                  total / (1024 * 1024), freeb / (1024 * 1024));
     }
+    if (!ensure_recording_directory()) return ESP_FAIL;
+    visit_recording_files(recover_complete_part,NULL);
     return recording_codec_init();
 }
 
@@ -161,67 +225,62 @@ void queue_clear(void)
     ESP_LOGI(TAG, "CLEAN scheduled: only verified server receipts allow local removal");
 }
 
+typedef struct { uint64_t queued,other; unsigned pending,retained; } storage_stats_t;
+static void storage_file(const char *relative, const char *path, void *arg)
+{
+    storage_stats_t *stats=arg;
+    struct stat st;
+    if (stat(path,&st) || !S_ISREG(st.st_mode)) return;
+    if (is_wav_name(relative)) { stats->queued+=st.st_size; stats->pending++; }
+    else { stats->other+=st.st_size; stats->retained++; }
+}
+
 void queue_log_storage(void)
 {
     if (!s_fs_lock || xSemaphoreTake(s_fs_lock, pdMS_TO_TICKS(2000)) != pdTRUE) return;
-    uint64_t total=0, freeb=0, queued=0, other=0;
-    unsigned pending=0, retained=0;
+    uint64_t total=0, freeb=0;
+    storage_stats_t stats={0};
     if (esp_vfs_fat_info(MOUNT, &total, &freeb) != ESP_OK) {
         ESP_LOGW(TAG, "STORAGE unavailable; no automatic format");
         xSemaphoreGive(s_fs_lock); return;
     }
-    DIR *dir=opendir(MOUNT); struct dirent *e;
-    if (dir) {
-        while ((e=readdir(dir))) {
-            char path[280]; struct stat st;
-            snprintf(path,sizeof(path),MOUNT "/%s",e->d_name);
-            if (stat(path,&st) || !S_ISREG(st.st_mode)) continue;
-            if (is_wav_name(e->d_name)) { queued+=st.st_size; pending++; }
-            else { other+=st.st_size; retained++; }
-        }
-        closedir(dir);
-    }
+    visit_recording_files(storage_file,&stats);
     /* Budget is deliberately larger than actual CBR Ogg output; round to 8 KiB clusters. */
     const uint64_t segment_alloc=(RECORDING_MAX_SEGMENT_BYTES+8191)/8192*8192;
     uint64_t available=freeb>QUEUE_RESERVE_BYTES ? freeb-QUEUE_RESERVE_BYTES : 0;
     uint64_t seconds=(available/segment_alloc)*RECORDING_SEGMENT_SECONDS;
     ESP_LOGI(TAG,"STORAGE total=%llu free=%llu queue_files=%u queue_bytes=%llu retained_files=%u retained_bytes=%llu reserve=%u opus_bps=%d offline_seconds=%llu two_hours=%d",
-             total,freeb,pending,queued,retained,other,(unsigned)QUEUE_RESERVE_BYTES,
+             total,freeb,stats.pending,stats.queued,stats.retained,stats.other,(unsigned)QUEUE_RESERVE_BYTES,
              RECORDING_BITRATE,seconds,seconds>=RECORDING_MIN_OFFLINE_SECONDS);
     xSemaphoreGive(s_fs_lock);
+}
+
+static void list_file(const char *relative, const char *path, void *arg)
+{
+    int *count=arg;
+    if (is_wav_name(relative)) { ESP_LOGI(TAG,"QUEUE_FILE %s",relative); (*count)++; }
+    else if (strstr(relative,".bad")) ESP_LOGW(TAG,"QUEUE_BAD %s",relative);
 }
 
 void queue_list(void)
 {
     if (!s_fs_lock || xSemaphoreTake(s_fs_lock, pdMS_TO_TICKS(2000)) != pdTRUE) return;
-    DIR *d = opendir(MOUNT);
     int n = 0;
-    if (!d) { ESP_LOGW(TAG, "QUEUE none (not mounted)"); xSemaphoreGive(s_fs_lock); return; }
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (is_wav_name(e->d_name)) {
-            ESP_LOGI(TAG, "QUEUE_FILE %s", e->d_name);
-            n++;
-        } else if (strncmp(e->d_name, "q_", 2) == 0 && strstr(e->d_name, ".bad")) {
-            ESP_LOGW(TAG, "QUEUE_BAD %s", e->d_name);
-        }
-    }
-    closedir(d);
+    visit_recording_files(list_file,&n);
     xSemaphoreGive(s_fs_lock);
     ESP_LOGI(TAG, "QUEUE_COUNT %d", n);
+}
+
+static void count_file(const char *relative, const char *path, void *arg)
+{
+    if (is_wav_name(relative)) (*(int *)arg)++;
 }
 
 int queue_count(void)
 {
     if (!s_fs_lock || xSemaphoreTake(s_fs_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return 0;
     int n = 0;
-    DIR *d = opendir(MOUNT);
-    if (!d) { xSemaphoreGive(s_fs_lock); return 0; }
-    struct dirent *e;
-    while ((e = readdir(d))) {
-        if (is_wav_name(e->d_name)) n++;
-    }
-    closedir(d);
+    visit_recording_files(count_file,&n);
     xSemaphoreGive(s_fs_lock);
     return n;
 }
@@ -232,9 +291,13 @@ esp_err_t queue_save(const uint8_t *pcm, int len, int64_t captured_at)
     uint8_t *encoded=NULL; size_t encoded_len=0;
     /* Encode outside the filesystem mutex; capture and upload remain independent. */
     esp_err_t result=recording_encode((const int16_t *)pcm,len/2,(uint32_t)esp_timer_get_time(),&encoded,&encoded_len);
-    if (result != ESP_OK) return result;
+    if (result != ESP_OK) { s_save_error="录音编码失败，尾段仅在内存，请勿关机"; return result; }
     if (xSemaphoreTake(s_fs_lock, pdMS_TO_TICKS(5000)) != pdTRUE) { free(encoded); return ESP_ERR_TIMEOUT; }
 
+    if (!ensure_recording_directory()) {
+        s_save_error="录音目录不可写，尾段仅在内存，请勿关机";
+        free(encoded); xSemaphoreGive(s_fs_lock); return ESP_FAIL;
+    }
     if (!ensure_space_locked((encoded_len+8191)/8192*8192)) {
         free(encoded);
         xSemaphoreGive(s_fs_lock);
@@ -243,10 +306,11 @@ esp_err_t queue_save(const uint8_t *pcm, int len, int64_t captured_at)
 
     uint32_t seq = next_sequence_locked();
     char path[96], part[104];
-    snprintf(path, sizeof(path), MOUNT "/q_%010lu_%010lld.opus", (unsigned long)seq, (long long)captured_at);
+    snprintf(path, sizeof(path), RECORDING_DIR "/q_%010lu_%010lld.opus", (unsigned long)seq, (long long)captured_at);
     snprintf(part, sizeof(part), "%s.part", path);
     FILE *f = fopen(part, "wb");
     if (!f) {
+        s_save_error="无法创建录音文件，尾段仅在内存，请勿关机";
         free(encoded);
         ESP_LOGE(TAG, "open part failed errno=%d: %s", errno, part);
         xSemaphoreGive(s_fs_lock);
@@ -258,6 +322,7 @@ esp_err_t queue_save(const uint8_t *pcm, int len, int64_t captured_at)
     free(encoded);
     if (fclose(f) != 0) ok = false;
     if (!ok || rename(part, path) != 0) {
+        s_save_error=ok?"录音重命名失败，文件已保留，请勿关机":"录音写盘失败，尾段仅在内存，请勿关机";
         ESP_LOGE(TAG, "atomic queue write failed errno=%d: %s", errno, part);
         xSemaphoreGive(s_fs_lock);
         return ESP_FAIL;

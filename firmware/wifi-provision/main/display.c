@@ -35,6 +35,8 @@ static bool s_dma_pending;
 static uint32_t s_full_generation;
 static uint32_t s_drawn_frames;
 static uint32_t s_failed_frames;
+static int s_requested_brightness = -1;
+static uint32_t s_brightness_updates;
 
 static const co5300_lcd_init_cmd_t vendor_init[] = {
     {0xFE, (uint8_t[]){0x20}, 1, 0},
@@ -124,10 +126,39 @@ static void i2c_init(void)
 
 void display_brightness(uint8_t level)
 {
-    if (!s_io) return;
-    uint8_t data[1] = {level};
-    uint32_t cmd = (LCD_OPCODE_WRITE_CMD << 24) | (0x51 << 8);
-    esp_lcd_panel_io_tx_param(s_io, cmd, data, sizeof(data));
+    /* Audio/button callers must never wait for SPI or a frame/DMA lock. */
+    __atomic_store_n(&s_requested_brightness, level, __ATOMIC_RELEASE);
+}
+
+static void brightness_task(void *arg)
+{
+    for (;;) {
+        if (__atomic_load_n(&s_requested_brightness,__ATOMIC_ACQUIRE)>=0 &&
+            xSemaphoreTake(s_flush_lock,pdMS_TO_TICKS(50))==pdTRUE) {
+            /* tx_param and draw_bitmap share driver transaction bookkeeping.
+             * Serializing both prevents a concurrent parameter write from
+             * draining another task's pending color transactions. */
+            bool ready=!s_dma_pending || xSemaphoreTake(s_trans_sem,pdMS_TO_TICKS(100))==pdTRUE;
+            if (ready) {
+                s_dma_pending=false;
+                int level=__atomic_exchange_n(&s_requested_brightness,-1,__ATOMIC_ACQ_REL);
+                if (level>=0) {
+                    uint8_t data[1]={(uint8_t)level};
+                    uint32_t cmd=(LCD_OPCODE_WRITE_CMD<<24)|(0x51<<8);
+                    if (esp_lcd_panel_io_tx_param(s_io,cmd,data,sizeof(data))==ESP_OK)
+                        s_brightness_updates++;
+                    else {
+                        /* Preserve a newer request if one arrived meanwhile. */
+                        int empty=-1;
+                        __atomic_compare_exchange_n(&s_requested_brightness,&empty,level,false,
+                                                    __ATOMIC_ACQ_REL,__ATOMIC_ACQUIRE);
+                    }
+                }
+            }
+            xSemaphoreGive(s_flush_lock);
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 esp_err_t display_init(void)
@@ -185,6 +216,7 @@ esp_err_t display_init(void)
 
     s_flush_lock = xSemaphoreCreateMutex();
     s_frame_lock = xSemaphoreCreateMutex();
+    if (!s_flush_lock || !s_frame_lock || !s_trans_sem) return ESP_ERR_NO_MEM;
     /* 预分配 DMA 安全的行缓冲（32 行 × 932 字节 = 30KB 内部 RAM） */
     s_dma_buf = heap_caps_malloc(LCD_H_RES * 8 * sizeof(uint16_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
     if (!s_dma_buf) {
@@ -198,6 +230,8 @@ esp_err_t display_init(void)
         return ESP_ERR_NO_MEM;
     }
     memset(s_fb, 0, LCD_H_RES * LCD_V_RES * sizeof(uint16_t));
+    if (xTaskCreate(brightness_task,"disp_ctl",3072,NULL,3,NULL)!=pdPASS)
+        return ESP_ERR_NO_MEM;
     display_brightness(0xC0);
     ESP_LOGI(TAG, "display ready (%dx%d)", LCD_H_RES, LCD_V_RES);
     return ESP_OK;
@@ -265,8 +299,9 @@ uint32_t display_full_generation(void) { return __atomic_load_n(&s_full_generati
 
 void display_log_diagnostics(void)
 {
-    ESP_LOGI(TAG, "health frames=%lu failed=%lu dma_pending=%d",
-             (unsigned long)s_drawn_frames, (unsigned long)s_failed_frames, s_dma_pending);
+    ESP_LOGI(TAG, "health frames=%lu failed=%lu dma_pending=%d brightness_updates=%lu requested=%d",
+             (unsigned long)s_drawn_frames, (unsigned long)s_failed_frames, s_dma_pending,
+             (unsigned long)s_brightness_updates,__atomic_load_n(&s_requested_brightness,__ATOMIC_ACQUIRE));
 }
 
 void display_flush(void)

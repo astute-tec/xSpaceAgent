@@ -5,6 +5,7 @@
  */
 #include <string.h>
 #include "esp_log.h"
+#include "esp_attr.h"
 #include "driver/i2s_std.h"
 #include "driver/i2s_tdm.h"
 #include "esp_codec_dev.h"
@@ -26,6 +27,18 @@ static i2s_chan_handle_t s_rx;
 static esp_codec_dev_handle_t s_in;
 esp_codec_dev_handle_t mic_input_dev(void) { return s_in; }
 static esp_codec_dev_handle_t s_out;
+static volatile uint32_t s_rx_overflows;
+
+static bool IRAM_ATTR rx_queue_overflow(i2s_chan_handle_t handle, i2s_event_data_t *event, void *arg)
+{
+    s_rx_overflows++;
+    return false;
+}
+
+void mic_log_diagnostics(void)
+{
+    ESP_LOGI(TAG,"health rx_dma_queue_overflows=%lu",(unsigned long)s_rx_overflows);
+}
 
 esp_err_t mic_init(void)
 {
@@ -33,7 +46,7 @@ esp_err_t mic_init(void)
     i2s_chan_config_t chan_cfg = {
         .id = I2S_NUM_0,
         .role = I2S_ROLE_MASTER,
-        .dma_desc_num = 6,
+        .dma_desc_num = 12, /* 180ms RX backlog; tolerate short Flash/TLS stalls */
         .dma_frame_num = 240,
         .auto_clear_after_cb = true,
         .auto_clear_before_cb = false,
@@ -105,6 +118,8 @@ esp_err_t mic_init(void)
 
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx, &std_cfg));
     ESP_ERROR_CHECK(i2s_channel_init_tdm_mode(s_rx, &tdm_cfg));
+    i2s_event_callbacks_t callbacks={.on_recv_q_ovf=rx_queue_overflow};
+    ESP_ERROR_CHECK(i2s_channel_register_event_callback(s_rx,&callbacks,NULL));
     ESP_ERROR_CHECK(i2s_channel_enable(s_tx));
     ESP_ERROR_CHECK(i2s_channel_enable(s_rx));
     ESP_LOGI(TAG, "duplex channels ready");

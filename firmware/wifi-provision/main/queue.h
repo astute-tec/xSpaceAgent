@@ -12,6 +12,7 @@ void queue_clear(void);
 void queue_log_storage(void);
 /* Encode 16k mono PCM to 20kbit/s CBR Ogg Opus, then save atomically. */
 esp_err_t queue_save(const uint8_t *pcm, int len, int64_t captured_at);
+const char *queue_save_error(void); /* actionable reason; RAM buffer is still retained */
 /* 逐个上传队列里的文件；全部处理完返回队列剩余数 */
 int queue_flush(void);
 int queue_flush_periodic(void);   /* 后台任务调用；请求触发或每 30 秒补传 */

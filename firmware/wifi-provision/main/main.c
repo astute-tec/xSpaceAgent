@@ -975,8 +975,9 @@ static void serial_cli_task(void *arg)
             ESP_LOGI(TAG, "I2C_SCAN_DONE found=%d", found);
         } else if (strncmp(line, "HUBURL ", 7) == 0) {
             char url[192] = {0}, tok[80] = {0};
-            if (sscanf(line + 7, "%191s %79s", url, tok) >= 1) {
-                recorder_set_url(url, tok);
+            int fields=sscanf(line + 7, "%191s %79s", url, tok);
+            if (fields >= 1) {
+                recorder_set_url(url, fields >= 2 ? tok : NULL);
                 ESP_LOGI(TAG, "CLI_HUBURL %s", url);
             } else {
                 ESP_LOGI(TAG, "CLI_ERR usage: HUBURL <url> [token]");
@@ -1082,6 +1083,10 @@ static void serial_cli_task(void *arg)
             extern void recorder_stop(void);
             recorder_stop();
             ESP_LOGI(TAG, "CLI_STOP");
+        } else if (!strcmp(line,"KEYBOTTOM")) {
+            extern void recorder_toggle_screen(void);
+            recorder_toggle_screen();
+            ESP_LOGI(TAG,"CLI_KEYBOTTOM");
         } else if (strncmp(line, "KEYTOP", 6) == 0) {
             extern void recorder_top_key(void);
             recorder_top_key();

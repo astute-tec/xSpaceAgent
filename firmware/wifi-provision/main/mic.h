@@ -10,6 +10,7 @@
 #define MIC_BYTES_PER_SEC (MIC_SAMPLE_RATE * MIC_CHANNELS * 2)
 
 esp_err_t mic_init(void);
+void mic_log_diagnostics(void);
 /* 读满 len 字节，返回实际读取的字节数；失败返回 <0 */
 int mic_read(void *buf, int len);
 esp_codec_dev_handle_t mic_input_dev(void);

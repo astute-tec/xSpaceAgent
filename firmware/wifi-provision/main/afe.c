@@ -10,11 +10,16 @@
  */
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
+#include <stdlib.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_partition.h"
 #include "esp_afe_sr_iface.h"
 #include "esp_afe_sr_models.h"
 #include "esp_afe_config.h"
@@ -35,8 +40,51 @@ static volatile bool s_running;
 static volatile bool s_ready;
 static volatile bool s_reset_requested;
 static volatile uint32_t s_overflows;
+static void *s_model_storage; /* AFE/model pointers retain this for app lifetime. */
 
-#define RING_SIZE (MIC_SAMPLE_RATE * 2)        /* 只保留约 1 秒最新音频 */
+static bool models_move_to_psram(srmodel_list_t *models)
+{
+    if (!models || !models->mmap_handle) return true;
+    if (models->num <= 0 || !models->model_data) return false;
+    size_t bytes=0;
+    for (int i=0;i<models->num;i++) {
+        srmodel_data_t *m=models->model_data[i];
+        if (!m || m->num<0 || !m->files || !m->data || !m->sizes) return false;
+        for (int j=0;j<m->num;j++) {
+            if (m->sizes[j]<0 || !m->files[j] || !m->data[j]) return false;
+            size_t aligned=((size_t)m->sizes[j]+15)&~(size_t)15;
+            if (bytes>SIZE_MAX-SRMODEL_STRING_LENGTH ||
+                aligned>SIZE_MAX-SRMODEL_STRING_LENGTH-bytes) return false;
+            bytes+=SRMODEL_STRING_LENGTH+aligned;
+        }
+    }
+    if (!bytes) return false;
+    uint8_t *storage=heap_caps_aligned_alloc(16,bytes,MALLOC_CAP_SPIRAM|MALLOC_CAP_8BIT);
+    if (!storage) return false; /* No model pointers changed on allocation failure. */
+    uint8_t *next=storage;
+    for (int i=0;i<models->num;i++) {
+        srmodel_data_t *m=models->model_data[i];
+        for (int j=0;j<m->num;j++) {
+            memcpy(next,m->files[j],SRMODEL_STRING_LENGTH);
+            m->files[j]=(char *)next;
+            next+=SRMODEL_STRING_LENGTH;
+            memcpy(next,m->data[j],m->sizes[j]);
+            m->data[j]=(char *)next;
+            next+=((size_t)m->sizes[j]+15)&~(size_t)15;
+        }
+    }
+    /* Model names/info were separately allocated by ESP-SR. Only files/data
+     * pointed into the mapping. Keeping any mmap defeats PSRAM XiP during
+     * Flash writes, suspending the capture scheduler despite IRAM-safe I2S. */
+    esp_partition_munmap(*(esp_partition_mmap_handle_t *)models->mmap_handle);
+    free(models->mmap_handle);
+    models->mmap_handle=NULL;
+    s_model_storage=storage;
+    ESP_LOGI(TAG,"model files moved to PSRAM: %u bytes; Flash mapping released",(unsigned)bytes);
+    return true;
+}
+
+#define RING_SIZE (MIC_SAMPLE_RATE * 2 * 2)    /* PSRAM：约 2 秒突发缓冲 */
 #define LEVEL_HISTORY 96                        /* 96 * 10ms ~= 1 秒 */
 static uint16_t s_level_history[LEVEL_HISTORY];
 static uint32_t s_level_seq;
@@ -194,6 +242,10 @@ esp_err_t afe_init(void)
      * 一个通道输出，两个 TDM slot 是同一信号——不存在独立参考通道）。
      * 不开 AEC：参考=语音本身会把语音当回声消掉。设备录音时不播放音频，无回声。 */
     srmodel_list_t *models = esp_srmodel_init("model");
+    if (!models_move_to_psram(models)) {
+        ESP_LOGE(TAG,"cannot move wake model to PSRAM; AFE not started");
+        return ESP_ERR_NO_MEM;
+    }
     char *wake_model = models ? esp_srmodel_filter(models, "wn", "nihaoxiaozhi") : NULL;
     ESP_LOGI(TAG, "wake model=%s", wake_model ? wake_model : "(missing)");
     afe_type_t type = AFE_TYPE_SR;
@@ -210,6 +262,12 @@ esp_err_t afe_init(void)
     cfg->vad_init = false;   /* 远场低 SNR 时 VAD 会门掉整段，先关 */
     cfg->agc_init = true;                   /* 远场小声自动增益（核心远场增益来源） */
     cfg->agc_compression_gain_db = 12;
+    /* Audio enhancement must outrank encoding/UI and avoid core0's WiFi/TLS
+     * bursts. The default internal task can otherwise starve with FEED full. */
+    cfg->afe_perferred_core = 1;
+    cfg->afe_perferred_priority = 9;
+    cfg->afe_ringbuf_size = 100;
+    cfg->memory_alloc_mode = AFE_MEMORY_ALLOC_MORE_PSRAM;
 
     s_afe = (esp_afe_sr_iface_t *)esp_afe_handle_from_config(cfg);
     s_afe_data = s_afe->create_from_config(cfg);
@@ -217,18 +275,21 @@ esp_err_t afe_init(void)
         ESP_LOGE(TAG, "afe create failed");
         return ESP_FAIL;
     }
-    s_ring = xRingbufferCreate(RING_SIZE, RINGBUF_TYPE_BYTEBUF);
+    s_ring = xRingbufferCreateWithCaps(RING_SIZE, RINGBUF_TYPE_BYTEBUF,
+                                     MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_ring) return ESP_ERR_NO_MEM;
     s_reset_done = xSemaphoreCreateBinary();
     if (!s_reset_done) return ESP_ERR_NO_MEM;
     s_running = true;
-    if (xTaskCreatePinnedToCore(feed_task, "afe_feed", 4096, NULL, 8, NULL, 0) != pdPASS)
+    /* Capture outranks enhancement and leaves WiFi/lwIP on core0. The enlarged
+     * AFE input ring absorbs short catch-up bursts after Flash writes. */
+    if (xTaskCreatePinnedToCore(feed_task, "afe_feed", 4096, NULL, 12, NULL, 1) != pdPASS)
         return ESP_FAIL;
     if (xTaskCreatePinnedToCore(fetch_task, "afe_fetch", 8192, NULL, 10, NULL, 1) != pdPASS)
         return ESP_FAIL;
     s_ready = true;
     s_afe->print_pipeline(s_afe_data);
-    ESP_LOGI(TAG, "AFE ready: mono+ns+agc+wakenet (aec off), %d Hz, ring=%d bytes",
+    ESP_LOGI(TAG, "AFE ready: feed12/fetch10/enhance9 on core1, mono+ns+agc+wakenet (aec off), %d Hz, ring=%d bytes",
              MIC_SAMPLE_RATE, RING_SIZE);
     return ESP_OK;
 }
